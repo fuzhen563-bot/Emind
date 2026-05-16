@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/your-org/emind/main/web/static/logo_sm.png" alt="Emind AI Logo" width="120" height="120">
+  <img src="/static/logo_sm.png" alt="Emind AI Logo" width="120" height="120">
   <h1>Emind AI</h1>
   <p><strong>亦梓·智脑 — 从研究原型到生产级大模型</strong></p>
   <p>
