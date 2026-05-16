@@ -1,0 +1,83 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: emind-api
+    ports:
+      - "8080:8080"
+    environment:
+      - BACKEND=${BACKEND:-cloud_api}
+      - VLLM_URL=http://vllm:8000/v1
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - emind-net
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: emind-vllm
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_NAME=${VLLM_MODEL:-Emind/Emind-7B}
+      - MAX_MODEL_LEN=${VLLM_MAX_LEN:-4096}
+      - GPU_MEMORY_UTILIZATION=${VLLM_GPU_UTIL:-0.9}
+    volumes:
+      - ./models:/models
+    command:
+      - "--model"
+      - "${VLLM_MODEL_PATH:-/models/emind-7b}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--gpu-memory-utilization"
+      - "${VLLM_GPU_UTIL:-0.9}"
+      - "--max-model-len"
+      - "${VLLM_MAX_LEN:-4096}"
+      - "--trust-remote-code"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    profiles:
+      - gpu
+    networks:
+      - emind-net
+
+  jupyter:
+    image: jupyter/datascience-notebook:latest
+    container_name: emind-jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    volumes:
+      - ./data:/home/jovyan/data
+      - ./data_pipeline:/home/jovyan/data_pipeline
+      - ./training:/home/jovyan/training
+    command: >
+      start-notebook.sh --NotebookApp.token='emind'
+    restart: unless-stopped
+    profiles:
+      - dev
+    networks:
+      - emind-net
+
+networks:
+  emind-net:
+    driver: bridge
