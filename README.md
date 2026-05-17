@@ -264,6 +264,11 @@ print(engine.generate("你好"))
    模型注册表 + 版本管理
    vLLM 生产级 Speculative Decoding 调优
 ```
+## 魔搭社区
+
+0.5b模型数据量仅1k多，回答几乎是在背诵数据，改善效果可以增大数据、增大模型或训练更久
+
+https://modelscope.cn/models/fuzhen/emind-0.5b/
 
 ## 技术栈
 
