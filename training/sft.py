@@ -55,6 +55,8 @@ class SFTTrainer(TrainerBase):
         input_ids = batch["input_ids"].to(self.device)
         labels = batch["labels"].to(self.device)
         loss_mask = batch.get("loss_mask")
+        if loss_mask is not None:
+            loss_mask = loss_mask.to(self.device)
 
         _, logits, _ = self.model(input_ids)
         vocab_size = logits.shape[-1]

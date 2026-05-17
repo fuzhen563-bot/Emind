@@ -105,6 +105,7 @@ def cmd_train(args):
         vocab_size=args.vocab_size, d_model=args.d_model, n_heads=args.n_heads,
         n_kv_heads=args.n_kv_heads, n_layers=args.n_layers, d_ff=args.d_model * 4,
         max_seq_len=args.max_seq_len, dropout=0.0,
+        activation_checkpointing=True,
     )
 
     import json
@@ -120,6 +121,7 @@ def cmd_train(args):
         learning_rate=args.lr, output_dir=args.output_dir,
         max_seq_len=args.max_seq_len, use_bf16=True,
         use_fsdp=args.use_fsdp,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     if args.mode in ("sft", "pretrain"):
@@ -430,6 +432,7 @@ def main():
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--output-dir", default="checkpoints")
     p.add_argument("--lora", action="store_true")
+    p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--temperature", type=float, default=2.0)

@@ -18,15 +18,18 @@ def precompute_rope_freqs(dim: int, max_len: int, theta: float = 10000.0,
         freqs = freqs / scaling_factor
     t = torch.arange(int(max_len * scaling_factor), device=device).float()
     freqs = torch.outer(t, freqs)
-    return torch.cos(freqs), torch.sin(freqs)
+    cos = torch.cos(freqs).repeat_interleave(2, dim=-1)
+    sin = torch.sin(freqs).repeat_interleave(2, dim=-1)
+    return cos, sin
 
 
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     dim = x.shape[-1]
     x_half = x.float().reshape(*x.shape[:-1], -1, 2)
     x_rot = torch.stack([-x_half[..., 1], x_half[..., 0]], dim=-1).reshape_as(x)
-    cos = cos[:x.shape[-2], :dim].unsqueeze(0).unsqueeze(0)
-    sin = sin[:x.shape[-2], :dim].unsqueeze(0).unsqueeze(0)
+    seq_len = x.shape[1]
+    cos = cos[:seq_len, :dim].view(1, seq_len, 1, dim)
+    sin = sin[:seq_len, :dim].view(1, seq_len, 1, dim)
     return (x.float() * cos + x_rot * sin).to(x.dtype)
 
 
@@ -169,6 +172,7 @@ class EmindConfig:
     pad_token_id: int = 0
     eos_token_id: int = 2
     bos_token_id: int = 1
+    activation_checkpointing: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "EmindConfig":
@@ -234,9 +238,15 @@ class EmindLM(nn.Module):
         mask = self.create_causal_mask(seq_len, device)
 
         new_caches = []
+        use_ckpt = self.training and self.config.activation_checkpointing
         for i, layer in enumerate(self.layers):
             cache = kv_caches[i] if kv_caches is not None else None
-            x, new_cache = layer(x, cos, sin, mask, cache)
+            if use_ckpt and cache is None:
+                x, new_cache = torch.utils.checkpoint.checkpoint(
+                    layer, x, cos, sin, mask, None, use_reentrant=False
+                )
+            else:
+                x, new_cache = layer(x, cos, sin, mask, cache)
             new_caches.append(new_cache)
 
         x = self.ln_f(x)
