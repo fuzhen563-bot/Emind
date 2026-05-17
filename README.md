@@ -26,6 +26,7 @@ Emind 是一个从零构建的生产级大语言模型框架，覆盖 **模型�
 - **评测套件** — MMLU、C-Eval、HumanEval（沙箱安全执行）一键运行
 - **WebUI** — FastAPI + SSE 流式、深/亮主题、思考过程可视化、模型竞技场、多模式切换
 - **OpenAI 兼容 API** — `/v1/chat/completions`、`/v1/completions`、`/v1/models`，支持 Function Calling
+- **代码质量** — 全链路 3 轮代码检修，修复 15+ 运行时 Bug（FSDP 未定义、generate RoPE 越界、同步生成器阻塞事件循环、**kwargs 静默丢弃等）
 - **Docker 部署** — 多阶段构建 + docker-compose（api / vllm / jupyter 多 profile）
 
 ## 项目结构
@@ -62,6 +63,7 @@ Emind_AI_v2.0/
 │   ├── humaneval.py         #   HumanEval (沙箱安全执行)
 │   └── runner.py            #   统一运行器 + leaderboard
 │
+├── quantization.py          # INT4 / FP8 量化推理
 ├── vllm_integration.py      # vLLM 深度集成 (Prefix Caching/Speculative Decoding/量化/LoRA/Server)
 ├── unified_inference.py     # 统一推理引擎 (vLLM/Ollama/llama.cpp/HF/Cloud/本地)
 ├── web_server.py            # FastAPI + OpenAI 兼容 API + Function Calling
@@ -108,6 +110,7 @@ pip install -e .
 | `pipeline` | 数据处理 / 蒸馏 | `cli.py pipeline --collect data/raw --process` |
 | `rl` | 强化学习 | `cli.py rl --rl-mode ppo --data rl.json` |
 | `vllm` | vLLM 诊断 | `cli.py vllm --detect --auto-configure` |
+| `train-tokenizer` | 训练 SentencePiece 分词器 | `cli.py train-tokenizer --data data.jsonl` |
 
 ## 训练一个 4B 模型
 
@@ -210,11 +213,11 @@ print(engine.generate("你好"))
 | 监督微调 | SFTTrainer | 指令微调，assistant-only loss masking |
 | 偏好对齐 | DPOTrainer | 标准 DPO loss |
 | 知识蒸馏 | DistillationTrainer | Logit-based 蒸馏 (温度缩放) |
-| 强化学习 | PPOTrainer | Clipped surrogate + value function + KL penalty |
+| 强化学习 | PPOTrainer | Clipped surrogate + value function + KL penalty (含 LR scheduler 步进修复、value loss 标量化) |
 | 强化学习 | GRPOTrainer | 组内 advantage 归一化，无 critic |
 | 奖励模型 | RewardModelTrainer | Pairwise ranking loss |
 | 高效微调 | LoRA | 低秩适配，支持 apply/merge/unmerge |
-| 分布式 | FSDP FULL_SHARD + DDP | BF16 混合精度 + Activation Checkpointing |
+| 分布式 | FSDP FULL_SHARD + DDP | BF16 混合精度 + Activation Checkpointing，已适配 2×32GB 双卡 |
 | 蒸馏数据 | DistillationPipeline | 5 类种子 + 6 种策略 → Teacher → SFT 数据 |
 
 ## 工程路线图
@@ -245,10 +248,21 @@ print(engine.generate("你好"))
   长上下文 128K+ (NTK-aware RoPE)
   CI/CD 流水线
 
-第三阶段 🚧 (规划中)
-  多模态扩展 (视觉/语音输入)
-  模型注册表 + 版本管理
-  vLLM 生产级 Speculative Decoding 调优
+第三阶段 ✅ (已完成)
+   PPO / GRPO 强化学习
+   Reward Model 训练
+   长上下文 128K+ (NTK-aware RoPE)
+   CI/CD 流水线
+   全链路 3 轮代码检修 (修复 15+ Bug)
+   **kwargs 推理参数转发 (蒸馏管线参数不再丢失)
+   WebUI 异步改造 (同步生成器不阻塞事件循环)
+   CLI `train-tokenizer` 子命令
+   双卡 2×32GB 分布式适配
+
+第四阶段 🚧 (规划中)
+   多模态扩展 (视觉/语音输入)
+   模型注册表 + 版本管理
+   vLLM 生产级 Speculative Decoding 调优
 ```
 
 ## 技术栈
