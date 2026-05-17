@@ -10,44 +10,44 @@ from training.trainer import TrainerBase
 
 class SFTDataset(Dataset):
     def __init__(self, data: List[Dict[str, Any]], tokenizer, max_seq_len: int = 2048, pad_token_id: int = 0):
-        self.data = data
-        self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.pad_token_id = pad_token_id
+        self.examples = []
+        for item in data:
+            if isinstance(item, str):
+                encoded = tokenizer.encode(item)
+                input_ids = encoded[:max_seq_len]
+                labels = input_ids.copy()
+                loss_mask = [1] * len(input_ids)
+            else:
+                prompt = item.get("prompt", "")
+                response = item.get("response", "")
+                full_text = prompt + response
+                encoded = tokenizer.encode(full_text)
+                input_ids = encoded[:max_seq_len]
+                labels = input_ids.copy()
+                prompt_len = len(tokenizer.encode(prompt))
+                loss_mask = [0] * prompt_len + [1] * (len(input_ids) - prompt_len)
+                if len(loss_mask) < max_seq_len:
+                    loss_mask = loss_mask + [0] * (max_seq_len - len(loss_mask))
+
+            pad_len = max_seq_len - len(input_ids)
+            if pad_len > 0:
+                input_ids = input_ids + [pad_token_id] * pad_len
+                labels = labels + [-100] * pad_len
+                loss_mask = loss_mask + [0] * pad_len
+
+            self.examples.append({
+                "input_ids": torch.tensor(input_ids[:max_seq_len], dtype=torch.long),
+                "labels": torch.tensor(labels[:max_seq_len], dtype=torch.long),
+                "loss_mask": torch.tensor(loss_mask[:max_seq_len], dtype=torch.float),
+            })
 
     def __len__(self):
-        return len(self.data)
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        if isinstance(item, str):
-            encoded = self.tokenizer.encode(item)
-            input_ids = encoded[:self.max_seq_len]
-            labels = input_ids.copy()
-            loss_mask = [1] * len(input_ids)
-        else:
-            prompt = item.get("prompt", "")
-            response = item.get("response", "")
-            full_text = prompt + response
-            encoded = self.tokenizer.encode(full_text)
-            input_ids = encoded[:self.max_seq_len]
-            labels = input_ids.copy()
-            prompt_len = len(self.tokenizer.encode(prompt))
-            loss_mask = [0] * prompt_len + [1] * (len(input_ids) - prompt_len)
-            if len(loss_mask) < self.max_seq_len:
-                loss_mask = loss_mask + [0] * (self.max_seq_len - len(loss_mask))
-
-        pad_len = self.max_seq_len - len(input_ids)
-        if pad_len > 0:
-            input_ids = input_ids + [self.pad_token_id] * pad_len
-            labels = labels + [-100] * pad_len
-            loss_mask = loss_mask + [0] * pad_len
-
-        return {
-            "input_ids": torch.tensor(input_ids[:self.max_seq_len], dtype=torch.long),
-            "labels": torch.tensor(labels[:self.max_seq_len], dtype=torch.long),
-            "loss_mask": torch.tensor(loss_mask[:self.max_seq_len], dtype=torch.float),
-        }
+        return self.examples[idx]
 
 
 class SFTTrainer(TrainerBase):

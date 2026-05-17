@@ -31,13 +31,11 @@ class EmindTokenizer:
         if model_path and os.path.exists(model_path):
             self._load_sp(model_path)
         else:
-            try:
+            if model_path:
                 import sentencepiece as spm
                 self._sp = spm.SentencePieceProcessor()
-                if model_path:
-                    self._sp.Load(model_path)
-            except ImportError:
-                self._fallback = _FallbackTokenizer(vocab_size, self.special_tokens)
+                self._sp.Load(model_path)
+            self._fallback = _FallbackTokenizer(vocab_size, self.special_tokens)
 
         self.pad_token_id = self.token_to_id(self.special_tokens["pad"])
         self.unk_token_id = self.token_to_id(self.special_tokens["unk"])

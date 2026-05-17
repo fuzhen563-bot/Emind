@@ -31,7 +31,10 @@ def cmd_rl(args):
     raw_data = []
     if os.path.exists(args.data):
         with open(args.data, encoding="utf-8") as f:
-            raw_data = json.load(f) if args.data.endswith(".json") else [json.loads(line) for line in f if line.strip()]
+            if args.data.endswith(".jsonl"):
+                raw_data = [json.loads(line) for line in f if line.strip()]
+            else:
+                raw_data = json.load(f)
     if not raw_data:
         raw_data = [{"prompt": "你好", "response": "世界", "reward": 1.0}]
 
@@ -112,7 +115,10 @@ def cmd_train(args):
     raw_data = []
     if os.path.exists(args.data):
         with open(args.data, encoding="utf-8") as f:
-            raw_data = json.load(f) if args.data.endswith(".json") else [line.strip() for line in f if line.strip()]
+            if args.data.endswith(".jsonl"):
+                raw_data = [json.loads(line) for line in f if line.strip()]
+            else:
+                raw_data = json.load(f)
     if not raw_data:
         raw_data = [{"prompt": "你好", "response": "你好！"}] * 20
 

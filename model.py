@@ -98,12 +98,8 @@ class GroupedQueryAttention(nn.Module):
 
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-        if mask is not None:
-            scores = scores + mask
-        attn = F.softmax(scores, dim=-1)
-        attn = F.dropout(attn, p=self.dropout, training=self.training)
-        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
+        out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         out = self.W_o(out)
         return out, new_kv_cache
 
