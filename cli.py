@@ -112,7 +112,7 @@ def cmd_train(args):
         activation_checkpointing=True,
         qk_norm=True,
         parallel_attn_ffn=True,
-        use_moe=True,
+        use_moe=args.moe,
         rope_scaling_type="yarn",
         rope_scaling_factor=32.0,
         original_max_len=4096,
@@ -517,6 +517,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--output-dir", default="checkpoints")
+    p.add_argument("--moe", action="store_true", help="启用 MoE（默认关闭）")
     p.add_argument("--lora", action="store_true")
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--lora-rank", type=int, default=8)
