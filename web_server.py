@@ -38,6 +38,12 @@ from unified_inference import (
     DEFAULT_CONFIGS,
 )
 
+try:
+    from vllm_integration import detect_vllm_capabilities, VLLMIntegratedEngine, VLLMConfig
+    VLLM_INTEGRATION_AVAILABLE = True
+except ImportError:
+    VLLM_INTEGRATION_AVAILABLE = False
+
 # ============================================================================
 # App Setup
 # ============================================================================
@@ -457,6 +463,17 @@ class BackendSwitchRequest(BaseModel):
     model_name: Optional[str] = None
     model_path: Optional[str] = None
     base_url: str = "http://localhost:11434"
+    # vLLM 参数
+    vllm_enable_prefix_caching: bool = True
+    vllm_enable_speculative: bool = False
+    vllm_speculative_draft_model: Optional[str] = None
+    vllm_num_speculative_tokens: int = 5
+    vllm_enable_lora: bool = False
+    vllm_lora_dir: Optional[str] = None
+    vllm_tensor_parallel_size: int = 1
+    vllm_gpu_memory_utilization: float = 0.90
+    vllm_dtype: str = "auto"
+    vllm_quantization: Optional[str] = None
 
 
 class OpenAIRequest(BaseModel):
@@ -465,6 +482,8 @@ class OpenAIRequest(BaseModel):
     max_tokens: int = 1024
     temperature: float = 0.7
     top_p: float = 0.9
+    tools: Optional[List[Dict]] = None
+    tool_choice: Optional[str] = None  # "auto", "none", or "required"
 
 
 class CompletionsRequest(BaseModel):
@@ -507,14 +526,14 @@ async def chat(req: ChatRequest):
         thinking_text = ""
         try:
             if engine and engine.is_available():
-                prompt = build_prompt(chat_session.messages[:-1], system_prompt)
+                prompt = build_prompt(chat_session.messages, system_prompt)
                 config = BackendConfig(
                     backend_type=engine.config.backend_type,
                     model_name=engine.config.model_name,
                     api_key=engine.config.api_key,
                     base_url=engine.config.base_url,
                     model_path=engine.config.model_path,
-                    max_new_tokens=max_tokens,
+                    max_tokens=max_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
@@ -585,7 +604,7 @@ async def chat_simple(req: ChatRequest):
                 api_key=engine.config.api_key,
                 base_url=engine.config.base_url,
                 model_path=engine.config.model_path,
-                max_new_tokens=max_tokens,
+                max_tokens=max_tokens,
                 temperature=temperature,
             )
             response_text = engine.generate(prompt, config=config)
@@ -671,7 +690,7 @@ async def arena_compare(req: ArenaRequest):
                     api_key=engine.config.api_key,
                     base_url=engine.config.base_url,
                     model_path=engine.config.model_path,
-                    max_new_tokens=req.max_tokens,
+                    max_tokens=req.max_tokens,
                     temperature=req.temperature,
                 )
                 response = engine.generate(req.prompt, config=config)
@@ -687,6 +706,24 @@ async def arena_compare(req: ArenaRequest):
 @app.get("/api/backends")
 async def list_backends():
     backends = []
+
+    # vLLM
+    vllm_available = False
+    vllm_caps = {}
+    try:
+        if VLLM_INTEGRATION_AVAILABLE:
+            vllm_caps = detect_vllm_capabilities()
+            vllm_available = vllm_caps.get("available", False)
+    except:
+        pass
+    backends.append({
+        "type": "vllm",
+        "name": "vLLM (深度推理引擎)",
+        "available": vllm_available,
+        "models": [],
+        "features": vllm_caps.get("features", []),
+        "description": "vLLM 高性能推理 — PagedAttention + Prefix Caching + Speculative Decoding + 量化",
+    })
 
     # 亦API 云端模型
     cloud_models = []
@@ -728,6 +765,35 @@ async def list_backends():
 async def switch_backend(req: BackendSwitchRequest):
     global _global_engine
     try:
+        # vLLM 模式: 走深度集成
+        if req.backend_type in ("vllm", "vllm_server"):
+            if VLLM_INTEGRATION_AVAILABLE:
+                from vllm_integration import VLLMIntegratedEngine, VLLMConfig, VLLMServingConfig, SpeculativeDecodingConfig, LoRAConfig
+                spec = SpeculativeDecodingConfig(
+                    enabled=req.vllm_enable_speculative,
+                    num_speculative_tokens=req.vllm_num_speculative_tokens,
+                )
+                lora = LoRAConfig(
+                    enabled=req.vllm_enable_lora,
+                    lora_dir=req.vllm_lora_dir,
+                )
+                vllm_cfg = VLLMConfig(
+                    model_path=req.model_path or req.model_name,
+                    model_name=req.model_name or "emind",
+                    use_server_mode=(req.backend_type == "vllm_server"),
+                    enable_prefix_caching=req.vllm_enable_prefix_caching,
+                    gpu_memory_utilization=req.vllm_gpu_memory_utilization,
+                    tensor_parallel_size=req.vllm_tensor_parallel_size,
+                    dtype=req.vllm_dtype,
+                    speculative=spec,
+                    lora=lora,
+                )
+                engine = VLLMIntegratedEngine(vllm_cfg)
+                if engine.is_available:
+                    print(f"vLLM 后端切换成功: {engine.mode}")
+                    return {"status": "ok", "backend_type": f"vllm_{engine.mode}", "is_available": True, "info": engine.get_info()}
+            return {"status": "error", "message": "vLLM 不可用"}
+
         _global_engine = create_inference_engine(
             backend_type=req.backend_type,
             model_name=req.model_name,
@@ -741,8 +807,23 @@ async def switch_backend(req: BackendSwitchRequest):
 
 @app.get("/api/models")
 async def list_models():
-    """获取所有可用模型（含亦API 云端模型）"""
-    models = {"cloud_api": [], "ollama": [], "local": []}
+    """获取所有可用模型（含亦API 云端模型 + vLLM 能力）"""
+    models = {"vllm": {"available": False, "features": []}, "cloud_api": [], "ollama": [], "local": []}
+
+    # vLLM
+    try:
+        if VLLM_INTEGRATION_AVAILABLE:
+            caps = detect_vllm_capabilities()
+            models["vllm"] = {
+                "available": caps.get("available", False),
+                "version": caps.get("version"),
+                "features": caps.get("features", []),
+                "gpu_count": caps.get("gpu_count", 0),
+                "has_bf16": caps.get("has_bf16", False),
+            }
+    except:
+        pass
+
     try:
         from unified_inference import get_cloud_api_models
         models["cloud_api"] = get_cloud_api_models()
@@ -792,7 +873,7 @@ async def openai_completions(req: CompletionsRequest):
                     api_key=engine.config.api_key,
                     base_url=engine.config.base_url,
                     model_path=engine.config.model_path,
-                    max_new_tokens=req.max_tokens,
+                    max_tokens=req.max_tokens,
                     temperature=req.temperature,
                     top_p=req.top_p,
                 )
@@ -839,19 +920,66 @@ async def health():
     return status
 
 
+def _build_tool_prompt(tools: List[Dict]) -> str:
+    """Inject tool definitions into system prompt for function calling."""
+    lines = ["\n\n你可以使用以下工具："]
+    for i, tool in enumerate(tools):
+        name = tool.get("function", tool).get("name", f"tool_{i}")
+        desc = tool.get("function", tool).get("description", "")
+        params = tool.get("function", tool).get("parameters", {})
+        lines.append(f"\n工具 {i+1}: {name}")
+        lines.append(f"  描述: {desc}")
+        lines.append(f"  参数: {json.dumps(params, ensure_ascii=False)}")
+    lines.append("\n当你需要调用工具时，请按以下格式输出（只输出一次，不要额外说明）：")
+    lines.append('  <tool_call>{"name": "工具名", "arguments": {"参数名": "值"}}</tool_call>')
+    return "\n".join(lines)
+
+
+def _parse_tool_call(text: str) -> Optional[Dict]:
+    """Parse <tool_call>...</tool_call> from model output."""
+    m = re.search(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(1).strip())
+            return {
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": data.get("name", ""), "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False)},
+            }
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return None
+
+
 @app.post("/v1/chat/completions")
 async def openai_compatible_chat(req: OpenAIRequest):
     system_prompt = "你是一个有帮助的AI助手，名字叫Emind，由亦梓科技开发。"
 
+    # Inject tool definitions if provided
+    if req.tools:
+        system_prompt += _build_tool_prompt(req.tools)
+
     # Build conversation with full history
     conversation_parts = []
     for msg in req.messages:
-        if msg["role"] == "system":
-            system_prompt = msg["content"]
-        elif msg["role"] == "user":
-            conversation_parts.append(f"用户: {msg['content']}")
-        elif msg["role"] == "assistant":
-            conversation_parts.append(f"助手: {msg['content']}")
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "system":
+            system_prompt = content
+            if req.tools:
+                system_prompt += _build_tool_prompt(req.tools)
+        elif role == "user":
+            conversation_parts.append(f"用户: {content}")
+        elif role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    conversation_parts.append(f"助手: [调用工具 {fn.get('name', '')} 参数 {fn.get('arguments', '')}]")
+            else:
+                conversation_parts.append(f"助手: {content}")
+        elif role == "tool":
+            conversation_parts.append(f"工具结果: {content}")
 
     conversation_parts.append("助手:")
     user_message = "\n".join(conversation_parts)
@@ -869,7 +997,7 @@ async def openai_compatible_chat(req: OpenAIRequest):
                     api_key=engine.config.api_key,
                     base_url=engine.config.base_url,
                     model_path=engine.config.model_path,
-                    max_new_tokens=req.max_tokens,
+                    max_tokens=req.max_tokens,
                     temperature=req.temperature,
                     top_p=req.top_p,
                 )
@@ -893,12 +1021,22 @@ async def openai_compatible_chat(req: OpenAIRequest):
         if req.stream:
             yield "data: [DONE]\n\n"
         else:
+            # Check for tool call in response
+            tool_call = _parse_tool_call(response_text)
+            if tool_call:
+                clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', response_text, flags=re.DOTALL).strip()
+                message = {"role": "assistant", "content": clean_text or None, "tool_calls": [tool_call]}
+                finish = "tool_calls"
+            else:
+                message = {"role": "assistant", "content": response_text}
+                finish = "stop"
+
             result = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": engine.config.model_name if engine else "emind",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
                 "usage": {
                     "prompt_tokens": estimate_tokens(user_message),
                     "completion_tokens": estimate_tokens(response_text),
@@ -915,9 +1053,16 @@ async def openai_compatible_chat(req: OpenAIRequest):
 # OAuth2 Authentication (亦梓科技聚合登录)
 # ============================================================================
 
+def _oauth_guard(request: Request):
+    """Check OAuth is configured before proceeding."""
+    if not OAUTH_CONFIG.get("server") or not OAUTH_CONFIG.get("client_id"):
+        raise HTTPException(503, "OAuth 未配置 (需要设置 OAUTH_SERVER / OAUTH_CLIENT_ID 环境变量)")
+
+
 @app.get("/auth/login")
 async def auth_login(request: Request):
     """Redirect to OAuth server for login"""
+    _oauth_guard(request)
     import secrets
     state = secrets.token_urlsafe(32)
     request.state.session["oauth_state"] = state
@@ -937,6 +1082,7 @@ async def auth_login(request: Request):
 @app.get("/auth/callback")
 async def auth_callback(request: Request):
     """Handle OAuth callback"""
+    _oauth_guard(request)
     code = request.query_params.get("code")
     state = request.query_params.get("state")
 
@@ -1052,15 +1198,30 @@ if __name__ == "__main__":
             port = int(sys.argv[i + 2])
             break
 
-    print("\n" + "=" * 56)
+    print("\n" + "=" * 60)
     print("  亦梓·智脑 Emind AI Web 对话服务 v2.0")
     print("  亦梓科技 © 2026")
-    print("=" * 56)
+    print("=" * 60)
     engine = get_engine()
     if engine:
         info = engine.get_backend_info()
         print(f"  后端: {info['backend_type']} | 可用: {info['is_available']}")
     print(f"  地址: http://localhost:{port}")
     print(f"  API 文档: http://localhost:{port}/docs")
-    print("=" * 56 + "\n")
+
+    # vLLM 能力检测
+    if VLLM_INTEGRATION_AVAILABLE:
+        try:
+            caps = detect_vllm_capabilities()
+            if caps.get("available"):
+                print(f"\n  [vLLM {caps.get('version', '')} 已就绪]")
+                features = caps.get("features", [])
+                if features:
+                    print(f"  特性: {', '.join(features)}")
+                if caps.get("gpu_count", 0) > 0:
+                    print(f"  GPU: {caps['gpu_count']}× {caps['gpu_names'][0] if caps.get('gpu_names') else ''}")
+        except:
+            pass
+
+    print("=" * 60 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=port)

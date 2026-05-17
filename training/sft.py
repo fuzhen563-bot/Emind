@@ -41,6 +41,7 @@ class SFTDataset(Dataset):
         if pad_len > 0:
             input_ids = input_ids + [self.pad_token_id] * pad_len
             labels = labels + [-100] * pad_len
+            loss_mask = loss_mask + [0] * pad_len
 
         return {
             "input_ids": torch.tensor(input_ids[:self.max_seq_len], dtype=torch.long),

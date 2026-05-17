@@ -88,6 +88,7 @@ def create_distributed_model(
             return model
         except ImportError:
             print("FSDP not available, falling back to DDP")
+            use_ddp = True
 
     if use_ddp and torch.cuda.is_available():
         return DDP(model, device_ids=[device.index], find_unused_parameters=False)
@@ -117,11 +118,19 @@ def create_distributed_dataloader(
 
 
 def save_distributed_model(model: nn.Module, path: str):
-    if is_main_process():
-        if hasattr(model, "module"):
+    state = None
+    if isinstance(model, (FSDP,)):
+        from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig, StateDictType
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
+            if is_main_process():
+                state = model.state_dict()
+    elif hasattr(model, "module"):
+        if is_main_process():
             state = model.module.state_dict()
-        else:
+    else:
+        if is_main_process():
             state = model.state_dict()
+    if state is not None:
         torch.save(state, path)
 
 

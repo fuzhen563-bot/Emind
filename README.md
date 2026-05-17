@@ -1,19 +1,11 @@
 <div align="center">
-<<<<<<< HEAD
-=======
-  <img src="web/static/logo_sm.png" alt="Emind AI Logo" width="120" height="120">
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
   <h1>Emind AI</h1>
   <p><strong>亦梓·智脑 — 从研究原型到生产级大模型</strong></p>
   <p>
     <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
     <img src="https://img.shields.io/badge/pytorch-2.0%2B-orange" alt="PyTorch 2.0+">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
-<<<<<<< HEAD
     <img src="https://img.shields.io/badge/status-production-blue" alt="Production">
-=======
-    <img src="https://img.shields.io/badge/status-beta-yellow" alt="Beta">
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
   </p>
 </div>
 
@@ -23,7 +15,6 @@ Emind 是一个从零构建的生产级大语言模型框架，覆盖 **模型�
 
 ## 特性
 
-<<<<<<< HEAD
 - **现代架构** — RoPE 位置编码（NTK-aware 128K+）、GQA 分组查询注意力、RMSNorm、SwiGLU FFN、KV Cache
 - **训练管线** — SFT（loss masking）/ DPO / 蒸馏（logit-based）/ PPO / GRPO / LoRA，统一 TrainerBase 基类
 - **vLLM 深度集成** — Prefix Caching、Speculative Decoding（Draft/N-Gram/EAGLE）、AWQ/GPTQ/FP8 量化、多 LoRA 动态切换、Server 模式
@@ -35,22 +26,11 @@ Emind 是一个从零构建的生产级大语言模型框架，覆盖 **模型�
 - **WebUI** — FastAPI + SSE 流式、深/亮主题、思考过程可视化、模型竞技场、多模式切换
 - **OpenAI 兼容 API** — `/v1/chat/completions`、`/v1/completions`、`/v1/models`，支持 Function Calling
 - **Docker 部署** — 多阶段构建 + docker-compose（api / vllm / jupyter 多 profile）
-=======
-- **🧠 现代架构** — RoPE 位置编码、GQA 分组查询注意力、RMSNorm、SwiGLU FFN、KV Cache
-- **🚀 训练管线** — 统一 TrainerBase + SFT / DPO / Distillation，内置 FSDP + BF16 混合精度
-- **🔌 多推理后端** — 本地模型、vLLM、Ollama、llama.cpp、HuggingFace、亦API 云端
-- **📊 数据管线** — 多源采集 → 清洗去重 → 质量过滤 → 数据合成 → 格式化输出
-- **🌐 WebUI** — FastAPI + SSE 流式响应，暗/亮主题、会话管理、模型对比竞技场
-- **🧪 评测套件** — MMLU / C-Eval / HumanEval 一键评测
-- **🐳 Docker 部署** — docker-compose 一键启动
-- **🔐 OAuth2 登录** — 支持亦梓科技聚合登录
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
 
 ## 项目结构
 
 ```
 Emind_AI_v2.0/
-<<<<<<< HEAD
 ├── model.py                 # 核心模型 (RoPE+GQA+RMSNorm+SwiGLU+KV Cache)
 ├── tokenizer.py             # 分词器 (SentencePiece + Fallback)
 ├── logger.py                # 统一日志
@@ -92,47 +72,6 @@ Emind_AI_v2.0/
 ├── tests/test_emind.py      # 30+ 单元测试 (Model/Tokenizer/Training/Data/Eval/RL/Distill)
 ├── Emind/                   # Python 包入口 (from Emind import *)
 └── 01_pretrain.py ~ 07_*.py # 原有训练脚本 (含 DeprecationWarning)
-=======
-├── model.py                 # 核心模型 (RoPE+GQA+RMSNorm+SwiGLU)
-├── tokenizer.py             # 分词器 (SentencePiece + Fallback)
-├── logger.py                # 统一日志
-├── distributed_utils.py     # 分布式训练工具 (DDP + FSDP)
-│
-├── training/                # 统一训练框架
-│   ├── config.py            #   训练配置
-│   ├── trainer.py           #   训练器基类 (BF16/FSDP/早停)
-│   ├── sft.py               #   监督微调 (loss masking)
-│   ├── dpo.py               #   偏好对齐 (DPO)
-│   ├── distill.py           #   知识蒸馏
-│   ├── lora.py              #   LoRA 微调
-│   ├── checkpoint.py        #   断点管理
-│   └── metrics.py           #   指标追踪
-│
-├── data_pipeline/           # 数据管线
-│   ├── collector.py         #   多源采集
-│   ├── cleaner.py           #   清洗/PII/去重
-│   ├── synthesizer.py       #   数据合成
-│   ├── formatter.py         #   格式转换
-│   └── dataset.py           #   版本管理
-│
-├── eval/                    # 评测套件
-│   ├── mmlu.py              #   MMLU
-│   ├── ceval.py             #   C-Eval
-│   ├── humaneval.py         #   HumanEval
-│   └── runner.py            #   统一运行器
-│
-├── unified_inference.py     # 统一推理引擎 (vLLM/Ollama/llama.cpp/HF/Cloud)
-├── web_server.py            # FastAPI + OpenAI 兼容 API
-├── web/                     # WebUI 前端
-├── cli.py                   # CLI (train/infer/serve/eval/pipeline)
-│
-├── Dockerfile               # 多阶段构建
-├── docker-compose.yml       # 编排部署
-│
-├── tests/test_emind.py      # 单元测试
-├── Emind/                   # Python 包入口 (from Emind import *)
-└── 01_pretrain.py ~ 07_*.py # 训练脚本 (薄封装)
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
 ```
 
 ## 安装
@@ -141,7 +80,6 @@ Emind_AI_v2.0/
 git clone <repo-url> && cd Emind_AI_v2.0
 
 # 核心依赖
-<<<<<<< HEAD
 pip install torch>=2.0.0 numpy sentencepiece
 pip install transformers>=4.36.0 accelerate>=0.25.0 requests
 
@@ -150,14 +88,6 @@ pip install "vllm>=0.6.0"          # vLLM (Prefix Caching + Speculative Decoding
 pip install autoawq                 # AWQ 量化 (可选)
 pip install auto-gptq               # GPTQ 量化 (可选)
 pip install llama-cpp-python        # llama.cpp
-=======
-pip install torch>=2.0.0 sentencepiece
-
-# 推理后端 (按需)
-pip install llama-cpp-python   # llama.cpp
-pip install transformers       # HuggingFace
-pip install vllm               # vLLM (GPU)
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
 
 # Web 服务
 pip install fastapi uvicorn jinja2 aiofiles sse-starlette
@@ -178,7 +108,6 @@ pip install -e .
 | `rl` | 强化学习 | `cli.py rl --rl-mode ppo --data rl.json` |
 | `vllm` | vLLM 诊断 | `cli.py vllm --detect --auto-configure` |
 
-<<<<<<< HEAD
 ## 训练一个 4B 模型
 
 ### 1. 蒸馏训练数据
@@ -204,82 +133,6 @@ python cli.py train \
   --max-seq-len 4096 --batch-size 8 \
   --epochs 3 --lr 2e-5 --use-bf16 \
   --output-dir checkpoints/emind-code-4b
-=======
-```python
-from model import EmindConfig, create_model
-import torch
-
-config = EmindConfig(vocab_size=32000, d_model=512, n_heads=8, n_kv_heads=4, n_layers=6)
-model = create_model(config)
-
-input_ids = torch.tensor([[1, 100, 200, 300]])
-output = model.generate(
-    input_ids,
-    max_new_tokens=100,
-    temperature=0.8,
-    top_p=0.9,
-    repetition_penalty=1.1,
-)
-```
-
-### 启动 Web 服务
-
-```bash
-# CLI 方式
-python cli.py serve
-
-# 或直接启动
-python web_server.py
-# 打开 http://localhost:3333
-```
-
-### 训练一个模型
-
-```python
-from model import EmindConfig, create_model
-from training import SFTTrainer, TrainingConfig, SFTDataset
-
-dataset = SFTDataset(data, tokenizer, max_seq_len=2048)
-
-cfg = EmindConfig(vocab_size=32000, d_model=768, n_heads=12, n_kv_heads=4, n_layers=12)
-model = create_model(cfg)
-train_cfg = TrainingConfig(batch_size=4, epochs=3, use_bf16=True)
-
-trainer = SFTTrainer(model, train_cfg, dataset)
-trainer.train()
-```
-
-### 数据处理管线
-
-```bash
-# 采集 → 清洗 → 格式化
-python cli.py pipeline --collect data/raw --process --format sft
-
-# 或使用 Python API
-from data_pipeline import DataCollector, DataCleaner, DataFormatter
-items = DataCollector().from_directory("data/raw")
-items = DataCleaner().clean(items, target_lang="zh")
-sft = DataFormatter().to_sft(items)
-```
-
-### 运行评测
-
-```bash
-python cli.py eval --model checkpoints/best/model.pt --benchmarks mmlu,ceval
-```
-
-### 分布式训练
-
-```bash
-torchrun --nproc_per_node=4 cli.py train --mode sft --data data/train.json --use-fsdp
-```
-
-### Docker 部署
-
-```bash
-docker-compose up -d
-# 访问 http://localhost:8080
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
 ```
 
 ### 3. DPO 偏好对齐
@@ -353,7 +206,6 @@ print(engine.generate("你好"))
 | 阶段 | 模块 | 说明 |
 |------|------|------|
 | 预训练 | SFTTrainer | 语言模型预训练 |
-<<<<<<< HEAD
 | 监督微调 | SFTTrainer | 指令微调，assistant-only loss masking |
 | 偏好对齐 | DPOTrainer | 标准 DPO loss |
 | 知识蒸馏 | DistillationTrainer | Logit-based 蒸馏 (温度缩放) |
@@ -363,19 +215,11 @@ print(engine.generate("你好"))
 | 高效微调 | LoRA | 低秩适配，支持 apply/merge/unmerge |
 | 分布式 | FSDP FULL_SHARD + DDP | BF16 混合精度 + Activation Checkpointing |
 | 蒸馏数据 | DistillationPipeline | 5 类种子 + 6 种策略 → Teacher → SFT 数据 |
-=======
-| 监督微调 | SFTTrainer | 指令数据微调，assistant-only loss masking |
-| 偏好对齐 | DPOTrainer | 标准 DPO loss |
-| 知识蒸馏 | DistillationTrainer | Logit-based 蒸馏 (温度缩放) |
-| 高效微调 | LoRA | 低秩适配，支持 merge/unmerge |
-| 分布式 | FSDP + DDP | FULL_SHARD + BF16 混合精度 + Activation Checkpointing |
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
 
 ## 工程路线图
 
 ```
 第一阶段 ✅ (已完成)
-<<<<<<< HEAD
   现代架构重写 (RoPE + GQA + RMSNorm + SwiGLU)
   统一训练框架 (TrainerBase / SFT / DPO / Distill / LoRA)
   FSDP 分布式 + BF16 混合精度
@@ -404,25 +248,6 @@ print(engine.generate("你好"))
   多模态扩展 (视觉/语音输入)
   模型注册表 + 版本管理
   vLLM 生产级 Speculative Decoding 调优
-=======
-  ├── 现代架构重写 (RoPE + GQA + RMSNorm + SwiGLU)
-  ├── 统一训练框架 (TrainerBase / SFT / DPO / Distill / LoRA)
-  ├── FSDP 分布式支持
-  ├── 分词器升级 (SentencePiece + Fallback)
-  ├── vLLM 推理引擎集成
-  ├── 完整数据管线 (采集→清洗→合成→格式化→版本管理)
-  ├── 自动化评测 (MMLU, C-Eval, HumanEval)
-  ├── OpenAI 兼容 API (/v1/*)
-  ├── WebUI 移动端适配 (3 断点 + 手势 + 键盘)
-  └── Docker 容器化 + docker-compose
-
-第二阶段 🚧 (进行中)
-  ├── CI/CD 流水线
-  ├── PPO / GRPO 强化学习
-  ├── Function Calling / Tool Use
-  ├── 长上下文 128K+ (NTK-aware RoPE)
-  └── 多模态扩展
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
 ```
 
 ## 技术栈
@@ -430,7 +255,6 @@ print(engine.generate("你好"))
 | 领域 | 技术选型 |
 |------|----------|
 | 深度学习 | PyTorch 2.0+ |
-<<<<<<< HEAD
 | 分布式 | FSDP FULL_SHARD / DDP |
 | 推理 | vLLM 0.6+ / Ollama / llama.cpp / HuggingFace / 亦API |
 | 服务 | FastAPI + SSE + httpx |
@@ -440,14 +264,6 @@ print(engine.generate("你好"))
 | 部署 | Docker + docker-compose |
 | 日志 | Python logging (EMIND_LOG_LEVEL) |
 | 量化 | AWQ / GPTQ / FP8 |
-=======
-| 分布式 | FSDP / DDP |
-| 推理 | vLLM / Ollama / llama.cpp / HuggingFace |
-| 服务 | FastAPI + SSE |
-| 前端 | 原生 HTML/CSS/JS |
-| 分词 | SentencePiece |
-| 部署 | Docker + docker-compose |
->>>>>>> bfc66c58144840bbe20a3794726f7ec470e415fe
 
 ## 贡献
 

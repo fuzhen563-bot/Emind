@@ -18,6 +18,7 @@ dependencies = [
     "accelerate>=0.25.0",
     "requests>=2.31.0",
     "pydantic>=2.10.0",
+    "httpx>=0.25.0",
 ]
 
 [project.scripts]
@@ -29,3 +30,17 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["Emind*", "training*", "data_pipeline*", "eval*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+ignore = ["E501", "F403", "F405"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.isort]
+profile = "black"
+line_length = 120

@@ -5,11 +5,16 @@ Emind 统一推理后端 - 支持多种模型来源
 
 import os
 import json
-import torch
 from typing import Optional, Dict, Any, List, Generator, Callable
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 import threading
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 import queue
 
 # 亦API 默认配置 (优先从环境变量读取)
@@ -41,13 +46,25 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
+# 尝试导入 vLLM 深度集成模块
+try:
+    from vllm_integration import (
+        VLLMIntegratedEngine, VLLMConfig, create_vllm_engine,
+        detect_vllm_capabilities, auto_configure_for_gpu,
+        DynamicLoRAManager, VLLMHealthMonitor,
+        SpeculativeDecodingConfig, LoRAConfig,
+    )
+    VLLM_INTEGRATION_AVAILABLE = True
+except ImportError:
+    VLLM_INTEGRATION_AVAILABLE = False
+
 from tokenizer import EmindTokenizer as SimpleTokenizer
 
 
 @dataclass
 class BackendConfig:
     """后端配置"""
-    backend_type: str = "ollama"  # ollama, llama_cpp, huggingface, local, cloud_api
+    backend_type: str = "ollama"  # ollama, llama_cpp, huggingface, local, cloud_api, vllm, vllm_server
     model_name: str = "llama2"
     model_path: Optional[str] = None
     base_url: str = "http://localhost:11434"
@@ -62,12 +79,26 @@ class BackendConfig:
     max_tokens: int = 200
     api_key: Optional[str] = None
 
+    # vLLM 特有
+    vllm_enable_prefix_caching: bool = True
+    vllm_enable_speculative: bool = False
+    vllm_speculative_draft_model: Optional[str] = None
+    vllm_num_speculative_tokens: int = 5
+    vllm_enable_lora: bool = False
+    vllm_lora_dir: Optional[str] = None
+    vllm_tensor_parallel_size: int = 1
+    vllm_gpu_memory_utilization: float = 0.90
+    vllm_dtype: str = "auto"
+    vllm_quantization: Optional[str] = None
+    vllm_enable_chunked_prefill: bool = True
+    vllm_max_model_len: Optional[int] = None
+
 
 class BaseBackend(ABC):
     """后端基类"""
 
     @abstractmethod
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         """同步生成"""
         pass
 
@@ -113,7 +144,7 @@ class OllamaBackend(BaseBackend):
             pass
         return []
 
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         """同步生成"""
         if config is None:
             config = self.config
@@ -223,7 +254,7 @@ class LlamaCppBackend(BaseBackend):
         """检查后端是否可用"""
         return LLAMA_CPP_AVAILABLE and self.model is not None
 
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         """同步生成"""
         if not self.is_available():
             return "模型未加载"
@@ -328,7 +359,7 @@ class HuggingFaceBackend(BaseBackend):
         """检查后端是否可用"""
         return TRANSFORMERS_AVAILABLE and self.model is not None
 
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         """同步生成"""
         if not self.is_available():
             return "模型未加载"
@@ -471,7 +502,7 @@ class CloudAPIBackend(BaseBackend):
             messages.append({"role": "user", "content": prompt})
         return messages
 
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         if config is None:
             config = self.config
         try:
@@ -583,7 +614,7 @@ class LocalModelBackend(BaseBackend):
         """检查后端是否可用"""
         return self.model is not None
 
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         """同步生成"""
         if not self.is_available():
             return "模型未加载"
@@ -601,7 +632,7 @@ class LocalModelBackend(BaseBackend):
 
         # 生成
         generated = []
-        eos_token_id = self.tokenizer.stoi.get(self.tokenizer.eos_token, 3)
+        eos_token_id = getattr(self.tokenizer, 'eos_token_id', 3)
 
         with torch.no_grad():
             for _ in range(config.max_tokens):
@@ -616,27 +647,25 @@ class LocalModelBackend(BaseBackend):
                     indices_to_remove = logits < torch.topk(logits, config.top_k)[0][..., -1, None]
                     logits[indices_to_remove] = float('-inf')
 
-                # Top-p
+                # Top-p (nucleus)
                 if config.top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-
-                    sorted_indices_to_remove = cumulative_probs > config.top_p
+                    cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cum_probs > config.top_p
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
-
                     indices_to_remove = sorted_indices_to_remove.scatter(
-                        1, sorted_indices, sorted_indices_to_remove
+                        dim=-1, index=sorted_indices, src=sorted_indices_to_remove
                     )
                     logits[indices_to_remove] = float('-inf')
 
                 probs = torch.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
 
-                if next_token.item() == eos_token_id:
+                token_id = next_token.item()
+                if token_id == eos_token_id:
                     break
-
-                generated.append(next_token.item())
+                generated.append(token_id)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
         return self.tokenizer.decode(generated)
@@ -664,9 +693,8 @@ class LocalModelBackend(BaseBackend):
 
         # 生成
         generated = []
-        eos_token_id = self.tokenizer.stoi.get(self.tokenizer.eos_token, 3)
-        special_tokens = {self.tokenizer.pad_token, self.tokenizer.bos_token,
-                        self.tokenizer.eos_token, self.tokenizer.unk_token}
+        eos_token_id = getattr(self.tokenizer, 'eos_token_id', 3)
+        decode = getattr(self.tokenizer, 'id_to_token', None)
 
         with torch.no_grad():
             for _ in range(config.max_tokens):
@@ -690,6 +718,21 @@ class LocalModelBackend(BaseBackend):
                 generated.append(token_id)
                 input_ids = torch.cat([input_ids, next_token], dim=1)
 
+                if decode:
+                    decoded_char = decode(token_id)
+                else:
+                    decoded_char = chr(token_id) if token_id < 256 else ''
+                if decoded_char and decoded_char not in ('<pad>', '<s>', '</s>', '<unk>'):
+                    if callback:
+                        callback(decoded_char)
+                    yield decoded_char
+
+                if len(input_ids[0]) > config.n_ctx:
+                    break
+
+                generated.append(token_id)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+
                 decoded_char = self.tokenizer.itos.get(token_id, '')
                 if decoded_char and decoded_char not in special_tokens:
                     if callback:
@@ -698,41 +741,97 @@ class LocalModelBackend(BaseBackend):
 
 
 class VLLMBackend(BaseBackend):
-    """vLLM 后端 — 高性能推理引擎 (PagedAttention + Continuous Batching)"""
+    """vLLM 后端 — 高性能推理引擎 (PagedAttention + Prefix Caching + Speculative Decoding)"""
 
     def __init__(self, config: BackendConfig):
         self.config = config
-        self.model = None
+        self.engine = None
         self._load_model()
 
     def _load_model(self):
         if not VLLM_AVAILABLE:
             print("vLLM 未安装 (pip install vllm)")
             return
+
+        if VLLM_INTEGRATION_AVAILABLE:
+            try:
+                cfg = VLLMConfig(
+                    model_path=self.config.model_path or self.config.model_name,
+                    model_name=self.config.model_name,
+                    max_model_len=self.config.vllm_max_model_len or self.config.n_ctx,
+                    gpu_memory_utilization=self.config.vllm_gpu_memory_utilization,
+                    tensor_parallel_size=self.config.vllm_tensor_parallel_size,
+                    enable_prefix_caching=self.config.vllm_enable_prefix_caching,
+                    dtype=self.config.vllm_dtype,
+                    enable_chunked_prefill=self.config.vllm_enable_chunked_prefill,
+                    use_server_mode=(self.config.backend_type == "vllm_server"),
+                    speculative=SpeculativeDecodingConfig(
+                        enabled=self.config.vllm_enable_speculative,
+                        draft_model=self.config.vllm_speculative_draft_model,
+                        num_speculative_tokens=self.config.vllm_num_speculative_tokens,
+                    ) if VLLM_INTEGRATION_AVAILABLE else None,
+                    lora=LoRAConfig(
+                        enabled=self.config.vllm_enable_lora,
+                        lora_dir=self.config.vllm_lora_dir,
+                    ) if VLLM_INTEGRATION_AVAILABLE else None,
+                )
+                if self.config.vllm_quantization:
+                    cfg.dtype = self.config.vllm_dtype
+                    if self.config.vllm_quantization in ("fp8",):
+                        cfg.dtype = "bfloat16"
+
+                self.engine = VLLMIntegratedEngine(cfg)
+                if self.engine.is_available:
+                    print(f"vLLM 引擎已就绪 (模式: {self.engine.mode})")
+                    return
+            except Exception as e:
+                print(f"vLLM 集成模块加载失败: {e}")
+
+        # Fallback: 使用原生 vLLM API
         model_path = self.config.model_path or self.config.model_name
         if not model_path:
             print("vLLM: 未指定模型路径或名称")
             return
         try:
-            print(f"Loading vLLM model: {model_path}")
-            self.model = VLLM(
-                model=model_path,
-                tensor_parallel_size=1,
-                dtype="bfloat16" if torch.cuda.is_bf16_supported() else "float16",
-                max_model_len=self.config.n_ctx,
-                trust_remote_code=True,
-            )
-            print("vLLM model loaded successfully")
+            print(f"加载 vLLM 模型 (原生): {model_path}")
+            kwargs = {
+                "model": model_path,
+                "tensor_parallel_size": self.config.vllm_tensor_parallel_size or 1,
+                "max_model_len": self.config.vllm_max_model_len or self.config.n_ctx,
+                "trust_remote_code": True,
+                "gpu_memory_utilization": self.config.vllm_gpu_memory_utilization or 0.90,
+                "enable_prefix_caching": self.config.vllm_enable_prefix_caching,
+            }
+            if self.config.vllm_dtype and self.config.vllm_dtype != "auto":
+                kwargs["dtype"] = self.config.vllm_dtype
+            elif torch.cuda.is_bf16_supported():
+                kwargs["dtype"] = "bfloat16"
+            else:
+                kwargs["dtype"] = "float16"
+            self.model = VLLM(**kwargs)
+            print("vLLM 模型加载成功")
+            print(f"  Prefix Caching: {self.config.vllm_enable_prefix_caching}")
         except Exception as e:
-            print(f"vLLM load failed: {e}")
+            print(f"vLLM 加载失败: {e}")
 
     def is_available(self) -> bool:
+        if self.engine is not None:
+            return self.engine.is_available
         return VLLM_AVAILABLE and self.model is not None
 
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
+        cfg = config or self.config
+        if self.engine is not None:
+            return self.engine.generate(
+                prompt,
+                max_tokens=cfg.max_tokens,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
+                top_k=cfg.top_k,
+                repetition_penalty=cfg.repeat_penalty,
+            )
         if not self.is_available():
             return "vLLM not available"
-        cfg = config or self.config
         try:
             params = SamplingParams(
                 temperature=cfg.temperature,
@@ -750,9 +849,23 @@ class VLLMBackend(BaseBackend):
         self, prompt: str, config: BackendConfig = None,
         callback: Callable[[str], None] = None,
     ) -> Generator[str, None, None]:
+        cfg = config or self.config
+        if self.engine is not None:
+            for token in self.engine.generate_stream(
+                prompt,
+                max_tokens=cfg.max_tokens,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
+                top_k=cfg.top_k,
+                repetition_penalty=cfg.repeat_penalty,
+            ):
+                if token:
+                    if callback:
+                        callback(token)
+                    yield token
+            return
         if not self.is_available():
             return
-        cfg = config or self.config
         try:
             params = SamplingParams(
                 temperature=cfg.temperature, top_p=cfg.top_p, top_k=cfg.top_k,
@@ -760,8 +873,8 @@ class VLLMBackend(BaseBackend):
             )
             for result in self.model.generate([prompt], params):
                 for output in result.outputs:
-                    for token_text in output.token_ids:
-                        text = self.model.get_tokenizer().decode([token_text])
+                    for token_id in output.token_ids:
+                        text = self.model.get_tokenizer().decode([token_id])
                         if text:
                             if callback:
                                 callback(text)
@@ -784,10 +897,11 @@ class UnifiedInferenceEngine:
 
         print(f"初始化后端: {backend_type}")
 
-        if backend_type == "vllm":
+        if backend_type in ("vllm", "vllm_server"):
             self.backend = VLLMBackend(self.config)
             if self.backend.is_available():
-                print("vLLM 后端已就绪")
+                mode_str = "Server" if backend_type == "vllm_server" else "Embedded"
+                print(f"vLLM 后端 ({mode_str}) 已就绪")
                 return
             print("vLLM 不可用，尝试其他后端...")
 
@@ -827,7 +941,7 @@ class UnifiedInferenceEngine:
 
         print("警告: 所有后端都不可用")
 
-    def generate(self, prompt: str, config: BackendConfig = None) -> str:
+    def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         """同步生成"""
         if self.backend:
             return self.backend.generate(prompt, config or self.config)
@@ -869,13 +983,16 @@ def create_inference_engine(
     base_url: str = "http://localhost:11434",
     device: str = "cuda",
     api_key: str = None,
+    **vllm_kwargs,
 ) -> UnifiedInferenceEngine:
     """创建推理引擎工厂函数"""
 
     if backend_type == "auto":
-        # 优先尝试 vLLM
-        if VLLM_AVAILABLE and model_path:
+        # 优先尝试 vLLM (检测可用性和 GPU 能力)
+        if VLLM_AVAILABLE and (model_path or os.environ.get("VLLM_MODEL_PATH")):
+            model_path = model_path or os.environ.get("VLLM_MODEL_PATH")
             backend_type = "vllm"
+            print(f"自动选择: vLLM ({model_path})")
 
     if backend_type == "auto":
         # 其次尝试亦API
@@ -916,6 +1033,19 @@ def create_inference_engine(
         base_url=base_url,
         device=device,
         api_key=api_key,
+        # vLLM 特定参数 (通过 **vllm_kwargs 传入)
+        vllm_enable_prefix_caching=vllm_kwargs.get("enable_prefix_caching", True),
+        vllm_enable_speculative=vllm_kwargs.get("enable_speculative", False),
+        vllm_speculative_draft_model=vllm_kwargs.get("speculative_draft_model", None),
+        vllm_num_speculative_tokens=vllm_kwargs.get("num_speculative_tokens", 5),
+        vllm_enable_lora=vllm_kwargs.get("enable_lora", False),
+        vllm_lora_dir=vllm_kwargs.get("lora_dir", None),
+        vllm_tensor_parallel_size=vllm_kwargs.get("tensor_parallel_size", 1),
+        vllm_gpu_memory_utilization=vllm_kwargs.get("gpu_memory_utilization", 0.90),
+        vllm_dtype=vllm_kwargs.get("dtype", "auto"),
+        vllm_quantization=vllm_kwargs.get("quantization", None),
+        vllm_enable_chunked_prefill=vllm_kwargs.get("enable_chunked_prefill", True),
+        vllm_max_model_len=vllm_kwargs.get("max_model_len", None),
     )
 
     return UnifiedInferenceEngine(config)
@@ -927,6 +1057,18 @@ DEFAULT_CONFIGS = {
         backend_type="vllm",
         model_path="./models/emind-7b",
         n_ctx=4096,
+        vllm_enable_prefix_caching=True,
+        vllm_tensor_parallel_size=1,
+        vllm_gpu_memory_utilization=0.90,
+    ),
+    "vllm_server": BackendConfig(
+        backend_type="vllm_server",
+        model_path="./models/emind-7b",
+        n_ctx=4096,
+        base_url="http://localhost:8000",
+        vllm_enable_prefix_caching=True,
+        vllm_tensor_parallel_size=1,
+        vllm_enable_chunked_prefill=True,
     ),
     "ollama": BackendConfig(
         backend_type="ollama",
@@ -953,13 +1095,15 @@ DEFAULT_CONFIGS = {
         backend_type="cloud_api",
         model_name="gpt-4o-mini",
         base_url="https://api.yiziyun.com",
-        api_key=DEFAULT_API_KEY or "emind-dev-key",
+        api_key=DEFAULT_API_KEY,
     ),
 }
 
 
 def get_cloud_api_models() -> List[str]:
     """获取亦API 可用模型列表"""
+    if not DEFAULT_API_KEY:
+        return []
     try:
         resp = requests.get(
             "https://api.yiziyun.com/v1/models",

@@ -5,18 +5,21 @@ services:
     build: .
     container_name: emind-api
     ports:
-      - "8080:8080"
+      - "${PORT:-3333}:3333"
     environment:
-      - BACKEND=${BACKEND:-cloud_api}
-      - VLLM_URL=http://vllm:8000/v1
-      - LOG_LEVEL=INFO
+      - EMIND_API_KEY=${EMIND_API_KEY:-}
+      - EMIND_LOG_LEVEL=${EMIND_LOG_LEVEL:-info}
+      - OAUTH_SERVER=${OAUTH_SERVER:-}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET:-}
     volumes:
       - ./data:/app/data
       - ./models:/app/models
-    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+      - ./checkpoints:/app/checkpoints
+    command: ["serve", "--port", "3333"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/models"]
+      test: ["CMD", "curl", "-f", "http://localhost:3333/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -27,11 +30,13 @@ services:
     image: vllm/vllm-openai:latest
     container_name: emind-vllm
     ports:
-      - "8000:8000"
+      - "${VLLM_PORT:-8000}:8000"
     environment:
       - MODEL_NAME=${VLLM_MODEL:-Emind/Emind-7B}
       - MAX_MODEL_LEN=${VLLM_MAX_LEN:-4096}
       - GPU_MEMORY_UTILIZATION=${VLLM_GPU_UTIL:-0.9}
+      - ENABLE_PREFIX_CACHING=true
+      - ENABLE_CHUNKED_PREFILL=true
     volumes:
       - ./models:/models
     command:
@@ -46,6 +51,8 @@ services:
       - "--max-model-len"
       - "${VLLM_MAX_LEN:-4096}"
       - "--trust-remote-code"
+      - "--enable-prefix-caching"
+      - "--enable-chunked-prefill"
     deploy:
       resources:
         reservations:
@@ -63,15 +70,16 @@ services:
     image: jupyter/datascience-notebook:latest
     container_name: emind-jupyter
     ports:
-      - "8888:8888"
+      - "${JUPYTER_PORT:-8888}:8888"
     environment:
       - JUPYTER_ENABLE_LAB=yes
     volumes:
-      - ./data:/home/jovyan/data
-      - ./data_pipeline:/home/jovyan/data_pipeline
-      - ./training:/home/jovyan/training
+      - ./data:/home/jovyan/work/data
+      - ./data_pipeline:/home/jovyan/work/data_pipeline
+      - ./training:/home/jovyan/work/training
+      - .:/home/jovyan/work
     command: >
-      start-notebook.sh --NotebookApp.token='emind'
+      start-notebook.sh --NotebookApp.token='${JUPYTER_TOKEN:-emind}'
     restart: unless-stopped
     profiles:
       - dev

@@ -68,7 +68,8 @@ class TrainerBase:
         )
 
     def _create_scheduler(self) -> LambdaLR:
-        total_steps = len(self.train_dataloader()) * self.config.epochs
+        effective_steps = len(self.train_dataset) // (self.config.batch_size * max(1, self.config.gradient_accumulation_steps))
+        total_steps = max(1, effective_steps * self.config.epochs)
 
         def lr_lambda(step: int) -> float:
             if step < self.config.warmup_steps:

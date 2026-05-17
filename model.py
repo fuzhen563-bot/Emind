@@ -10,9 +10,13 @@ from dataclasses import dataclass, field
 # RoPE (Rotary Position Embedding)
 # =============================================================================
 
-def precompute_rope_freqs(dim: int, max_len: int, theta: float = 10000.0, device: Optional[torch.device] = None):
+def precompute_rope_freqs(dim: int, max_len: int, theta: float = 10000.0,
+                          device: Optional[torch.device] = None,
+                          scaling_factor: float = 1.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device).float() / dim))
-    t = torch.arange(max_len, device=device).float()
+    if scaling_factor != 1.0:
+        freqs = freqs / scaling_factor
+    t = torch.arange(int(max_len * scaling_factor), device=device).float()
     freqs = torch.outer(t, freqs)
     return torch.cos(freqs), torch.sin(freqs)
 
@@ -93,7 +97,7 @@ class GroupedQueryAttention(nn.Module):
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            scores = scores + mask
         attn = F.softmax(scores, dim=-1)
         attn = F.dropout(attn, p=self.dropout, training=self.training)
         out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
@@ -160,6 +164,8 @@ class EmindConfig:
     max_seq_len: int = 4096
     dropout: float = 0.0
     rope_theta: float = 10000.0
+    rope_scaling_type: Optional[str] = None  # "ntk", "linear", or None
+    rope_scaling_factor: float = 1.0        # e.g. 32 for 4K→128K
     pad_token_id: int = 0
     eos_token_id: int = 2
     bos_token_id: int = 1
@@ -189,7 +195,13 @@ class EmindLM(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight
 
-        cos, sin = precompute_rope_freqs(config.d_model // config.n_heads, config.max_seq_len * 2, config.rope_theta)
+        scale = config.rope_scaling_factor if config.rope_scaling_type else 1.0
+        cos, sin = precompute_rope_freqs(
+            config.d_model // config.n_heads,
+            int(config.max_seq_len * scale),
+            config.rope_theta,
+            scaling_factor=scale,
+        )
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 

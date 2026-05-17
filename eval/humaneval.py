@@ -3,9 +3,21 @@ HumanEval Evaluator — 代码生成评测
 格式：{"prompt": ..., "test": ..., "entry_point": ...}
 """
 import json
-import signal
+import threading
 from typing import Dict, Any, List, Optional, Callable
 from eval.base import EvaluatorBase
+
+
+class TimeoutError(Exception):
+    pass
+
+
+def _run_with_timeout(code: str, local_vars: dict, timeout: float, result_holder: list):
+    try:
+        exec(code, {"__builtins__": {}}, local_vars)
+        result_holder.append(True)
+    except Exception:
+        result_holder.append(False)
 
 
 class HumanEvalEvaluator(EvaluatorBase):
@@ -50,11 +62,17 @@ class HumanEvalEvaluator(EvaluatorBase):
         return self.results
 
     def _check_execution(self, code: str, entry_point: str) -> bool:
-        try:
-            local_vars = {}
-            exec(code, {"__builtins__": __builtins__}, local_vars)
-            if entry_point not in local_vars:
-                return False
-            return True
-        except Exception:
+        local_vars = {}
+        result_holder = []
+        t = threading.Thread(
+            target=_run_with_timeout,
+            args=(code, local_vars, self.timeout, result_holder),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=self.timeout)
+        if t.is_alive():
             return False
+        if not result_holder or not result_holder[0]:
+            return False
+        return entry_point in local_vars

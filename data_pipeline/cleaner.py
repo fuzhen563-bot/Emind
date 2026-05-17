@@ -74,12 +74,21 @@ class DataCleaner:
         return max(0.0, score)
 
     def strip_pii(self, text: str, mask_token: str = "[REDACTED]") -> str:
-        phone = re.sub(r'1[3-9]\d{9}', mask_token, text)
-        id_card = re.sub(r'\d{17}[\dXx]', mask_token, phone)
-        email = re.sub(r'[\w.-]+@[\w.-]+\.\w+', mask_token, id_card)
-        ip = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', mask_token, email)
-        bank = re.sub(r'\d{16,19}', mask_token, ip)
-        return bank
+        # 手机号 (Chinese mobile)
+        text = re.sub(r'1[3-9]\d{9}', mask_token, text)
+        # 身份证号 (Chinese ID: 18 digits)
+        text = re.sub(r'\d{17}[\dXx]', mask_token, text)
+        # 邮箱
+        text = re.sub(r'[\w.-]+@[\w.-]+\.\w+', mask_token, text)
+        # IP 地址
+        text = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', mask_token, text)
+        # 银行卡号 (16-19 digits)
+        text = re.sub(r'\d{16,19}', mask_token, text)
+        # 统一社会信用代码 (18位 数字+大写字母)
+        text = re.sub(r'[A-Z0-9]{18}', mask_token, text)
+        # 护照号 (e.g. E12345678)
+        text = re.sub(r'\b[A-Z]\d{8}\b', mask_token, text)
+        return text
 
     def detect_language(self, text: str) -> str:
         cn_chars = len(re.findall(r'[\u4e00-\u9fff]', text))

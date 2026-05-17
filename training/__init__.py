@@ -1,14 +1,47 @@
-from training.config import TrainingConfig
-from training.checkpoint import CheckpointManager
-from training.metrics import MetricsTracker
-from training.trainer import TrainerBase
-from training.sft import SFTTrainer
-from training.dpo import DPOTrainer
-from training.distill import DistillationTrainer
-from training.lora import apply_lora, merge_lora, lora_state_dict, LoRALayer
+# Lazy-load torch-dependent modules on first use
+from training.distillation_pipeline import DistillationPipeline, DistillationConfig, distill_and_train
+
+
+def __getattr__(name):
+    import importlib
+    _LAZY = {
+        "TrainingConfig": ("training.config", "TrainingConfig"),
+        "MetricsTracker": ("training.metrics", "MetricsTracker"),
+        "TrainerBase": ("training.trainer", "TrainerBase"),
+        "SFTTrainer": ("training.sft", "SFTTrainer"),
+        "SFTDataset": ("training.sft", "SFTDataset"),
+        "DPOTrainer": ("training.dpo", "DPOTrainer"),
+        "DPODataset": ("training.dpo", "DPODataset"),
+        "DistillationTrainer": ("training.distill", "DistillationTrainer"),
+        "DistillationDataset": ("training.distill", "DistillationDataset"),
+        "apply_lora": ("training.lora", "apply_lora"),
+        "merge_lora": ("training.lora", "merge_lora"),
+        "lora_state_dict": ("training.lora", "lora_state_dict"),
+        "LoRALayer": ("training.lora", "LoRALayer"),
+        "CheckpointManager": ("training.checkpoint", "CheckpointManager"),
+        "PPOConfig": ("training.rl", "PPOConfig"),
+        "GRPOConfig": ("training.rl", "GRPOConfig"),
+        "PPODataset": ("training.rl", "PPODataset"),
+        "PPOTrainer": ("training.rl", "PPOTrainer"),
+        "GRPOTrainer": ("training.rl", "GRPOTrainer"),
+        "RewardModel": ("training.rl", "RewardModel"),
+        "RewardModelTrainer": ("training.rl", "RewardModelTrainer"),
+    }
+    if name in _LAZY:
+        mod_path, attr = _LAZY[name]
+        mod = importlib.import_module(mod_path)
+        return getattr(mod, attr)
+    raise AttributeError(f"module 'training' has no attribute '{name}'")
+
 
 __all__ = [
     "TrainingConfig", "CheckpointManager", "MetricsTracker",
-    "TrainerBase", "SFTTrainer", "DPOTrainer", "DistillationTrainer",
+    "TrainerBase", "SFTTrainer", "SFTDataset",
+    "DPOTrainer", "DPODataset",
+    "DistillationTrainer", "DistillationDataset",
     "apply_lora", "merge_lora", "lora_state_dict", "LoRALayer",
+    "PPOConfig", "GRPOConfig", "PPODataset",
+    "PPOTrainer", "GRPOTrainer",
+    "RewardModel", "RewardModelTrainer",
+    "DistillationPipeline", "DistillationConfig", "distill_and_train",
 ]
