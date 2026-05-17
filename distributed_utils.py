@@ -119,12 +119,18 @@ def create_distributed_dataloader(
 
 def save_distributed_model(model: nn.Module, path: str):
     state = None
-    if isinstance(model, (FSDP,)):
-        from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig, StateDictType
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
-            if is_main_process():
-                state = model.state_dict()
-    elif hasattr(model, "module"):
+    if torch.distributed.is_initialized():
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        if isinstance(model, FSDP):
+            from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig, StateDictType
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
+                if is_main_process():
+                    state = model.state_dict()
+            if state is not None:
+                torch.save(state, path)
+            return
+
+    if hasattr(model, "module"):
         if is_main_process():
             state = model.module.state_dict()
     else:

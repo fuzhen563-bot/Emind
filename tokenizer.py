@@ -30,11 +30,7 @@ class EmindTokenizer:
 
         if model_path and os.path.exists(model_path):
             self._load_sp(model_path)
-        else:
-            if model_path:
-                import sentencepiece as spm
-                self._sp = spm.SentencePieceProcessor()
-                self._sp.Load(model_path)
+        if self._sp is None:
             self._fallback = _FallbackTokenizer(vocab_size, self.special_tokens)
 
         self.pad_token_id = self.token_to_id(self.special_tokens["pad"])
@@ -52,28 +48,26 @@ class EmindTokenizer:
         return self._sp is not None
 
     def train(self, corpus_path: str, model_prefix: str = "emind_tokenizer"):
-        if self._sp is not None:
-            import sentencepiece as spm
-            spm.SentencePieceTrainer.train(
-                input=corpus_path,
-                model_prefix=model_prefix,
-                vocab_size=self.vocab_size,
-                character_coverage=0.9995,
-                model_type="bpe",
-                pad_id=0,
-                unk_id=1,
-                bos_id=2,
-                eos_id=3,
-                pad_piece=self.special_tokens["pad"],
-                unk_piece=self.special_tokens["unk"],
-                bos_piece=self.special_tokens["bos"],
-                eos_piece=self.special_tokens["eos"],
-                user_defined_symbols="<|im_start|>,<|im_end|>,<|tool_call|>,<|tool_result|>",
-            )
-            self._sp = spm.SentencePieceProcessor()
-            self._sp.Load(f"{model_prefix}.model")
-        elif self._fallback:
-            raise RuntimeError("Cannot train: install sentencepiece for training, or use pre-trained model")
+        import sentencepiece as spm
+        spm.SentencePieceTrainer.train(
+            input=corpus_path,
+            model_prefix=model_prefix,
+            vocab_size=self.vocab_size,
+            character_coverage=0.9995,
+            model_type="bpe",
+            pad_id=0,
+            unk_id=1,
+            bos_id=2,
+            eos_id=3,
+            pad_piece=self.special_tokens["pad"],
+            unk_piece=self.special_tokens["unk"],
+            bos_piece=self.special_tokens["bos"],
+            eos_piece=self.special_tokens["eos"],
+            user_defined_symbols="<|im_start|>,<|im_end|>,<|tool_call|>,<|tool_result|>",
+        )
+        self._sp = spm.SentencePieceProcessor()
+        self._sp.Load(f"{model_prefix}.model")
+        self._fallback = None
 
     def encode(self, text: str, add_bos: bool = True, add_eos: bool = False) -> List[int]:
         if self._sp is not None:

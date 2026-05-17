@@ -221,27 +221,15 @@ class PPOTrainer(TrainerBase):
         reward_model: Optional[Union[RewardModel, Callable]] = None,
         tokenizer=None,
     ):
-        self.model = model
-        self.config = config
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
+        from training.config import TrainingConfig
+        super().__init__(model, config, train_dataset, eval_dataset)
         self.tokenizer = tokenizer
-
-        self.device = torch.device(config.device)
-        self.model.to(self.device)
 
         self.ref_model = ref_model
         if self.ref_model is not None:
             self.ref_model.to(self.device)
             self.ref_model.eval()
             for p in self.ref_model.parameters():
-                p.requires_grad = False
-
-        self.reward_model = reward_model
-        if isinstance(self.reward_model, RewardModel):
-            self.reward_model.to(self.device)
-            self.reward_model.eval()
-            for p in self.reward_model.parameters():
                 p.requires_grad = False
 
         self.value_head = nn.Linear(self.model.config.d_model, 1)
@@ -255,6 +243,12 @@ class PPOTrainer(TrainerBase):
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config.epochs * max(len(train_dataset), 1),
         )
+        self.reward_model = reward_model
+        if isinstance(self.reward_model, RewardModel):
+            self.reward_model.to(self.device)
+            self.reward_model.eval()
+            for p in self.reward_model.parameters():
+                p.requires_grad = False
         self.checkpoint = CheckpointManager(config.output_dir, config.save_total_limit, config.experiment_name)
         self.metrics = MetricsTracker()
         self.global_step = 0
@@ -340,8 +334,7 @@ class PPOTrainer(TrainerBase):
         else:
             kl_loss = 0.0
 
-        v_loss = F.mse_loss(values, returns, reduction="none")
-        v_loss = v_loss * self.config.vf_coef
+        v_loss = (F.mse_loss(values, returns, reduction="none") * self.config.vf_coef).mean()
 
         total = pg_loss + kl_loss + v_loss
         return total, pg_loss, kl_loss, v_loss
@@ -386,6 +379,7 @@ class PPOTrainer(TrainerBase):
                     loss.backward()
                     nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     self.optimizer.step()
+                    self.scheduler.step()
 
                 self.global_step += 1
                 n += 1

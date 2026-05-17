@@ -2,9 +2,10 @@
 """
 Emind CLI — 统一命令行入口
 
-用法:
-    python cli.py train --mode sft --data data/sft.json
-    python cli.py infer --model checkpoints/latest/model.pt --prompt "你好"
+    用法:
+        python cli.py train --mode sft --data data/sft.json
+        python cli.py train-tokenizer --data data/distilled/emind_code_4b/distilled_sft.jsonl
+        python cli.py infer --model checkpoints/latest/model.pt --prompt "你好"
     python cli.py serve
     python cli.py eval --benchmarks mmlu,ceval --model checkpoints/best/model.pt
     python cli.py pipeline --collect data/raw --process --format sft
@@ -102,13 +103,19 @@ def cmd_train(args):
     from tokenizer import EmindTokenizer
     from training import SFTTrainer, DPOTrainer, DistillationTrainer, TrainingConfig, SFTDataset, DPODataset, DistillationDataset, apply_lora
 
-    tokenizer = EmindTokenizer(vocab_size=args.vocab_size)
+    tokenizer = EmindTokenizer(vocab_size=args.vocab_size, model_path=args.tokenizer_path)
 
     cfg = EmindConfig(
         vocab_size=args.vocab_size, d_model=args.d_model, n_heads=args.n_heads,
         n_kv_heads=args.n_kv_heads, n_layers=args.n_layers, d_ff=args.d_model * 4,
         max_seq_len=args.max_seq_len, dropout=0.0,
         activation_checkpointing=True,
+        qk_norm=True,
+        parallel_attn_ffn=True,
+        use_moe=True,
+        rope_scaling_type="yarn",
+        rope_scaling_factor=32.0,
+        original_max_len=4096,
     )
 
     import json
@@ -152,6 +159,73 @@ def cmd_train(args):
 
     trainer.train()
 
+    from training.distributed import cleanup as dist_cleanup
+    dist_cleanup()
+
+
+def cmd_train_tokenizer(args):
+    import json
+    from pathlib import Path
+    from tokenizer import EmindTokenizer
+
+    corpus_path = args.corpus or args.data
+    corpus_lines = []
+
+    if os.path.exists(corpus_path):
+        with open(corpus_path, encoding="utf-8") as f:
+            if corpus_path.endswith(".jsonl"):
+                for line in f:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    corpus_lines.append(item.get("prompt", "") + item.get("response", ""))
+            else:
+                corpus_lines = [line.strip() for line in f if line.strip()]
+
+    if not corpus_lines:
+        corpus_lines = ["你好，世界！Hello, world!"]
+
+    tmp_dir = Path(args.output_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    corpus_file = str(tmp_dir / "corpus.txt")
+    with open(corpus_file, "w", encoding="utf-8") as f:
+        for line in corpus_lines:
+            f.write(line.strip() + "\n")
+
+    print(f"Corpus: {len(corpus_lines)} lines -> {corpus_file}")
+
+    model_prefix = str(tmp_dir / "emind_tokenizer")
+    sp_model_path = model_prefix + ".model"
+
+    tokenizer = EmindTokenizer(vocab_size=args.vocab_size)
+    tokenizer.train(corpus_file, model_prefix=model_prefix)
+
+    print(f"Tokenizer saved: {sp_model_path}")
+
+    new_tokenizer = EmindTokenizer(vocab_size=args.vocab_size, model_path=sp_model_path)
+    print(f"Vocab size: {len(new_tokenizer)}")
+    print(f"Sample encode '你好': {new_tokenizer.encode('你好')}")
+
+    if args.data and args.data.endswith(".jsonl") and args.reencode:
+        out_path = args.reencode
+        with open(args.data, encoding="utf-8") as fin, open(out_path, "w", encoding="utf-8") as fout:
+            for line in fin:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                prompt = item.get("prompt", "")
+                response = item.get("response", "")
+                new_item = {
+                    "prompt": prompt,
+                    "response": response,
+                    "tokens": {
+                        "input_ids": new_tokenizer.encode(prompt + response),
+                        "prompt_len": len(new_tokenizer.encode(prompt)),
+                    }
+                }
+                fout.write(json.dumps(new_item, ensure_ascii=False) + "\n")
+        print(f"Re-encoded data saved: {out_path}")
+
 
 def cmd_infer(args):
     import torch
@@ -167,6 +241,12 @@ def cmd_infer(args):
         state = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
         model.to(device).eval()
+
+        if args.quantize:
+            from quantization import quantize_model, estimate_model_size
+            model = quantize_model(model, mode=args.quantize, group_size=args.quantize_groups)
+            print(f"Quantized ({args.quantize}): {estimate_model_size(model, args.quantize)}")
+
         tokenizer = EmindTokenizer(vocab_size=cfg.vocab_size)
     else:
         from unified_inference import create_inference_engine
@@ -443,6 +523,7 @@ def main():
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--temperature", type=float, default=2.0)
     p.add_argument("--use-fsdp", action="store_true")
+    p.add_argument("--tokenizer-path", default=None, help="SentencePiece 模型路径")
 
     # infer
     p = sub.add_parser("infer", help="推理")
@@ -465,6 +546,9 @@ def main():
     p.add_argument("--vllm-quantization", default=None, help="量化方式 (awq/gptq/fp8)")
     p.add_argument("--vllm-lora", action="store_true", help="启用 LoRA")
     p.add_argument("--vllm-lora-dir", default=None, help="LoRA 模块目录")
+    # 量化推理
+    p.add_argument("--quantize", default=None, choices=["int4", "fp8"], help="量化模式 (int4=权重 INT4, fp8=需要 H100)")
+    p.add_argument("--quantize-groups", type=int, default=128, help="INT4 量化组大小")
 
     # serve
     p = sub.add_parser("serve", help="启动 Web 服务")
@@ -486,6 +570,8 @@ def main():
     p.add_argument("--vllm-dtype", default="auto", help="数据类型 (auto/float16/bfloat16/fp8)")
     p.add_argument("--vllm-quantization", default=None, help="量化方式 (awq/gptq/fp8)")
     p.add_argument("--no-vllm-chunked-prefill", action="store_false", dest="vllm_chunked_prefill", default=True, help="禁用 Chunked Prefill")
+    p.add_argument("--quantize", default=None, choices=["int4", "fp8"], help="量化模式")
+    p.add_argument("--quantize-groups", type=int, default=128, help="INT4 量化组大小")
     p.add_argument("--vllm-max-model-len", type=int, default=None, help="vLLM 最大模型长度")
     p.add_argument("--vllm-lora", action="store_true", help="启用 LoRA")
     p.add_argument("--vllm-lora-dir", default=None, help="LoRA 模块目录")
@@ -553,6 +639,14 @@ def main():
     p.add_argument("--info", action="store_true", help="显示详细系统信息")
     p.add_argument("--auto-configure", action="store_true", help="自动生成推荐配置")
 
+    # train-tokenizer 子命令
+    p = sub.add_parser("train-tokenizer", help="训练 SentencePiece 分词器")
+    p.add_argument("--data", default=None, help="语料 JSONL 文件")
+    p.add_argument("--corpus", default=None, help="纯文本语料文件 (每行一条)")
+    p.add_argument("--vocab-size", type=int, default=32000)
+    p.add_argument("--output-dir", default="tokenizers", help="模型输出目录")
+    p.add_argument("--reencode", default=None, help="用新 tokenizer 重新编码 data 并输出到此路径")
+
     args = parser.parse_args()
 
     if args.command == "train":
@@ -569,6 +663,8 @@ def main():
         cmd_rl(args)
     elif args.command == "vllm":
         cmd_vllm(args)
+    elif args.command == "train-tokenizer":
+        cmd_train_tokenizer(args)
 
 
 if __name__ == "__main__":

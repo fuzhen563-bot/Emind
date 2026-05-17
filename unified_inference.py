@@ -6,7 +6,7 @@ Emind 统一推理后端 - 支持多种模型来源
 import os
 import json
 from typing import Optional, Dict, Any, List, Generator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from abc import ABC, abstractmethod
 import threading
 
@@ -59,6 +59,25 @@ except ImportError:
     VLLM_INTEGRATION_AVAILABLE = False
 
 from tokenizer import EmindTokenizer as SimpleTokenizer
+
+
+def _apply_kwargs_to_config(config: BackendConfig, **kwargs) -> BackendConfig:
+    """将常见生成参数 kwargs 映射到 BackendConfig 字段，返回新实例"""
+    mapping = {
+        'max_new_tokens': 'max_tokens',
+        'max_tokens': 'max_tokens',
+        'temperature': 'temperature',
+        'top_p': 'top_p',
+        'top_k': 'top_k',
+        'repeat_penalty': 'repeat_penalty',
+    }
+    overrides = {}
+    for kwarg_key, config_key in mapping.items():
+        if kwarg_key in kwargs:
+            overrides[config_key] = kwargs[kwarg_key]
+    if overrides:
+        return replace(config, **overrides)
+    return config
 
 
 @dataclass
@@ -416,7 +435,8 @@ class HuggingFaceBackend(BaseBackend):
             for _ in range(config.max_tokens):
                 with torch.no_grad():
                     outputs = self.model(generated_ids)
-                    next_token_logits = outputs.logits[:, -1, :] / config.temperature
+                    temp = config.temperature if config.temperature > 0 else 1.0
+                    next_token_logits = outputs.logits[:, -1, :] / temp
 
                     # Top-k 采样
                     if config.top_k > 0:
@@ -721,7 +741,7 @@ class LocalModelBackend(BaseBackend):
                 if decode:
                     decoded_char = decode(token_id)
                 else:
-                    decoded_char = chr(token_id) if token_id < 256 else ''
+                    decoded_char = self.tokenizer.decode([token_id])
                 if decoded_char and decoded_char not in ('<pad>', '<s>', '</s>', '<unk>'):
                     if callback:
                         callback(decoded_char)
@@ -730,14 +750,7 @@ class LocalModelBackend(BaseBackend):
                 if len(input_ids[0]) > config.n_ctx:
                     break
 
-                generated.append(token_id)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-
-                decoded_char = self.tokenizer.itos.get(token_id, '')
-                if decoded_char and decoded_char not in special_tokens:
-                    if callback:
-                        callback(decoded_char)
-                    yield decoded_char
+    # end of stream_generate
 
 
 class VLLMBackend(BaseBackend):
@@ -944,7 +957,8 @@ class UnifiedInferenceEngine:
     def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
         """同步生成"""
         if self.backend:
-            return self.backend.generate(prompt, config or self.config)
+            cfg = _apply_kwargs_to_config(config or self.config, **kwargs)
+            return self.backend.generate(prompt, cfg)
         return "后端未初始化"
 
     def stream_generate(
@@ -955,7 +969,8 @@ class UnifiedInferenceEngine:
     ) -> Generator[str, None, None]:
         """流式生成"""
         if self.backend:
-            return self.backend.stream_generate(prompt, config or self.config, callback)
+            cfg = _apply_kwargs_to_config(config or self.config)
+            return self.backend.stream_generate(prompt, cfg, callback)
         return
 
     def is_available(self) -> bool:

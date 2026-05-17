@@ -577,7 +577,7 @@ class DistillationPipeline:
             for i, prompt in enumerate(prompts):
                 teacher_idx = i % len(teachers)
                 teacher = teachers[teacher_idx]
-                name = teacher_names[teacher_idx] if teacher_names else f"teacher_{teacher_idx}"
+                name = teacher_names[teacher_idx % len(teacher_names)] if teacher_names else f"teacher_{teacher_idx}"
                 strategy = random.choice(strats)
                 try:
                     response = teacher.generate(

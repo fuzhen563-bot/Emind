@@ -42,6 +42,11 @@ def apply_lora(model: EmindLM, target_modules: Optional[List[str]] = None, rank:
         lora = LoRALayer(module.in_features, module.out_features, rank=rank, alpha=alpha)
         setattr(module, "lora", lora)
 
+        # 冻结原始线性权重，只训练 LoRA 参数
+        module.weight.requires_grad = False
+        if module.bias is not None:
+            module.bias.requires_grad = False
+
         def forward_with_lora(original_forward, lora_layer):
             def new_forward(x):
                 return original_forward(x) + lora_layer(x)

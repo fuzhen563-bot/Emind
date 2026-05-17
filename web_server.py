@@ -11,6 +11,7 @@ import json
 import re
 import os
 import random
+import threading
 import hmac
 import hashlib
 import base64
@@ -27,26 +28,26 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 import uvicorn
 import httpx
-import hmac
-import hashlib
-import base64
 
-from unified_inference import (
-    UnifiedInferenceEngine,
-    BackendConfig,
-    create_inference_engine,
-    DEFAULT_CONFIGS,
-)
-
-try:
-    from vllm_integration import detect_vllm_capabilities, VLLMIntegratedEngine, VLLMConfig
-    VLLM_INTEGRATION_AVAILABLE = True
-except ImportError:
-    VLLM_INTEGRATION_AVAILABLE = False
-
-# ============================================================================
-# App Setup
-# ============================================================================
+# 保留 asyncio.to_thread 的向后兼容别名
+async def aiterate_sync_gen(sync_gen):
+    """在独立线程中迭代同步生成器，产出异步生成器，避免阻塞事件循环"""
+    loop = asyncio.get_running_loop()
+    queue = asyncio.Queue()
+    SENTINEL = object()
+    def _run():
+        try:
+            for item in sync_gen:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    while True:
+        item = await queue.get()
+        if item is SENTINEL:
+            break
+        yield item
 
 app = FastAPI(title="亦梓·智脑 Emind AI", version="2.0")
 
@@ -545,7 +546,7 @@ async def chat(req: ChatRequest):
                         await asyncio.sleep(0.04)
                     thinking_text = simulated
 
-                for token in engine.stream_generate(prompt, config=config):
+                async for token in aiterate_sync_gen(engine.stream_generate(prompt, config=config)):
                     if token:
                         assistant_response += token
                         yield f"data: {json.dumps({'token': token})}\n\n"
@@ -607,7 +608,7 @@ async def chat_simple(req: ChatRequest):
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
-            response_text = engine.generate(prompt, config=config)
+            response_text = await asyncio.to_thread(engine.generate, prompt, config)
     except Exception as e:
         print(f"生成错误: {e}")
 
@@ -877,7 +878,7 @@ async def openai_completions(req: CompletionsRequest):
                     temperature=req.temperature,
                     top_p=req.top_p,
                 )
-                for token in engine.stream_generate(prompt_text, config=config):
+                async for token in aiterate_sync_gen(engine.stream_generate(prompt_text, config=config)):
                     if token:
                         response_text += token
                         if req.stream:
@@ -1001,7 +1002,7 @@ async def openai_compatible_chat(req: OpenAIRequest):
                     temperature=req.temperature,
                     top_p=req.top_p,
                 )
-                for token in engine.stream_generate(prompt, config=config):
+                async for token in aiterate_sync_gen(engine.stream_generate(prompt, config=config)):
                     if token:
                         response_text += token
                         if req.stream:

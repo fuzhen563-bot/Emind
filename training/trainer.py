@@ -4,6 +4,7 @@ import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from typing import Optional, Dict, Any, Callable, Union
@@ -27,8 +28,16 @@ class TrainerBase:
         self.config = config
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
-        self.device = torch.device(config.device)
 
+        self.rank = 0
+        self.world_size = 1
+        if config.use_fsdp:
+            from training.distributed import init_distributed
+            result = init_distributed()
+            if result[0] is not None:
+                self.rank, self.world_size = result
+
+        self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         if config.use_fsdp:
             self._wrap_fsdp()
@@ -46,21 +55,32 @@ class TrainerBase:
         try:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+            from torch.distributed.fsdp.api import MixedPrecision
             from model import TransformerBlock
 
             wrap_policy = transformer_auto_wrap_policy(transformer_layer_cls={TransformerBlock})
+
+            mp_policy = None
+            if self.config.use_bf16:
+                mp_policy = MixedPrecision(
+                    param_dtype=torch.bfloat16,
+                    reduce_dtype=torch.bfloat16,
+                    buffer_dtype=torch.bfloat16,
+                )
+
             self.model = FSDP(
                 self.model,
                 auto_wrap_policy=wrap_policy,
-                mixed_precision=None,
-                device_id=self.device if self.device.type == "cuda" else None,
+                mixed_precision=mp_policy,
+                device_id=torch.cuda.current_device(),
             )
-        except ImportError:
-            print("FSDP not available, falling back to DDP")
+        except ImportError as e:
+            print(f"FSDP not available ({e}), falling back to DDP")
 
     def _create_optimizer(self) -> AdamW:
+        params = [p for p in self.model.parameters() if p.requires_grad]
         return AdamW(
-            self.model.parameters(),
+            params,
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             betas=(self.config.adam_beta1, self.config.adam_beta2),
@@ -68,7 +88,7 @@ class TrainerBase:
         )
 
     def _create_scheduler(self) -> LambdaLR:
-        effective_steps = len(self.train_dataset) // (self.config.batch_size * max(1, self.config.gradient_accumulation_steps))
+        effective_steps = len(self.train_dataset) // (self.config.batch_size * self.world_size * max(1, self.config.gradient_accumulation_steps))
         total_steps = max(1, effective_steps * self.config.epochs)
 
         def lr_lambda(step: int) -> float:
@@ -84,10 +104,17 @@ class TrainerBase:
         return LambdaLR(self.optimizer, lr_lambda)
 
     def train_dataloader(self) -> DataLoader:
+        sampler = None
+        shuffle = True
+        if self.config.use_fsdp and self.world_size > 1:
+            sampler = DistributedSampler(self.train_dataset, shuffle=True)
+            shuffle = False
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.config.dataloader_num_workers,
             pin_memory=self.config.pin_memory,
         )
@@ -95,10 +122,14 @@ class TrainerBase:
     def eval_dataloader(self) -> Optional[DataLoader]:
         if self.eval_dataset is None:
             return None
+        sampler = None
+        if self.config.use_fsdp and self.world_size > 1:
+            sampler = DistributedSampler(self.eval_dataset, shuffle=False)
         return DataLoader(
             self.eval_dataset,
             batch_size=self.config.eval_batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=self.config.dataloader_num_workers,
             pin_memory=self.config.pin_memory,
         )
@@ -155,11 +186,15 @@ class TrainerBase:
         best_eval_loss = float('inf')
         early_stop_counter = 0
         self.model.train()
+        is_main = self.rank == 0
 
         for epoch in range(self.config.epochs):
             self.epoch = epoch
             epoch_loss = 0.0
             epoch_start = time.time()
+
+            if hasattr(train_loader, 'sampler') and isinstance(train_loader.sampler, DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
 
             for batch_idx, batch in enumerate(train_loader):
                 step_loss = self.training_step(batch)
@@ -170,10 +205,10 @@ class TrainerBase:
                     current_lr = self.optimizer.param_groups[0]["lr"]
                     self.metrics.log_step(step_loss.item() * self.config.gradient_accumulation_steps, current_lr, self.global_step)
 
-                    if self.global_step % self.config.logging_steps == 0:
+                    if is_main and self.global_step % self.config.logging_steps == 0:
                         print(f"Epoch {epoch+1}/{self.config.epochs} | Step {self.global_step} | Loss: {step_loss.item() * self.config.gradient_accumulation_steps:.4f} | LR: {current_lr:.2e}")
 
-                    if self.global_step % self.config.eval_steps == 0 and self.eval_dataset is not None:
+                    if is_main and self.global_step % self.config.eval_steps == 0 and self.eval_dataset is not None:
                         eval_metrics = self.evaluate()
                         self.metrics.log_eval(eval_metrics.get("eval_loss", 0), eval_metrics.get("perplexity"))
                         print(f"  Eval loss: {eval_metrics.get('eval_loss', 0):.4f} | Perplexity: {eval_metrics.get('perplexity', 0):.2f}")
@@ -188,23 +223,32 @@ class TrainerBase:
                                 print(f"Early stopping triggered at step {self.global_step}")
                                 return
 
-                    if self.global_step % self.config.save_steps == 0:
+                    if is_main and self.global_step % self.config.save_steps == 0:
                         self._save()
 
                 epoch_loss += step_loss.item() * self.config.gradient_accumulation_steps
 
-            avg_epoch_loss = epoch_loss / total_batches
-            self.metrics.end_epoch(epoch, avg_epoch_loss)
-            epoch_time = time.time() - epoch_start
-            print(f"Epoch {epoch+1} completed in {epoch_time:.1f}s | Avg loss: {avg_epoch_loss:.4f}")
+            if is_main:
+                avg_epoch_loss = epoch_loss / total_batches
+                self.metrics.end_epoch(epoch, avg_epoch_loss)
+                epoch_time = time.time() - epoch_start
+                print(f"Epoch {epoch+1} completed in {epoch_time:.1f}s | Avg loss: {avg_epoch_loss:.4f}")
 
-        self.metrics.save(str(Path(self.config.output_dir) / self.config.experiment_name / "metrics.json"))
-        print(f"Training complete. {self.metrics.summary()}")
+        if is_main:
+            self.metrics.save(str(Path(self.config.output_dir) / self.config.experiment_name / "metrics.json"))
+            print(f"Training complete. {self.metrics.summary()}")
 
     def _save(self, is_best: bool = False):
         model_state = self.model.state_dict()
         if self.config.use_fsdp:
-            model_state = self.model.state_dict()
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=cfg):
+                model_state = self.model.state_dict()
+            if self.rank != 0:
+                return
+
         self.checkpoint.save(
             step=self.global_step,
             model_state=model_state,
