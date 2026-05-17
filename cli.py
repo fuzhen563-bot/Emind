@@ -135,6 +135,8 @@ def cmd_train(args):
         max_seq_len=args.max_seq_len, use_bf16=True,
         use_fsdp=args.use_fsdp,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        save_steps=args.save_steps,
+        logging_steps=args.logging_steps,
     )
 
     if args.mode in ("sft", "pretrain"):
@@ -236,7 +238,17 @@ def cmd_infer(args):
 
     if args.model and os.path.exists(args.model):
         ckpt = torch.load(args.model, map_location=device, weights_only=False)
-        cfg = EmindConfig.from_dict(ckpt.get("model_config", {}))
+        cfg_dict = ckpt.get("model_config", {})
+        if not cfg_dict:
+            cfg_dict = dict(
+                d_model=args.d_model or 768,
+                n_heads=args.n_heads or 12,
+                n_kv_heads=args.n_kv_heads or 4,
+                n_layers=args.n_layers or 12,
+                vocab_size=args.vocab_size or 32000,
+                max_seq_len=args.max_seq_len or 2048,
+            )
+        cfg = EmindConfig.from_dict(cfg_dict)
         model = create_model(cfg)
         state = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
@@ -247,7 +259,9 @@ def cmd_infer(args):
             model = quantize_model(model, mode=args.quantize, group_size=args.quantize_groups)
             print(f"Quantized ({args.quantize}): {estimate_model_size(model, args.quantize)}")
 
-        tokenizer = EmindTokenizer(vocab_size=cfg.vocab_size)
+        if not args.tokenizer_path:
+            print("WARNING: --tokenizer-path 未指定，将使用字符级 fallback tokenizer（输出可能为乱码）")
+        tokenizer = EmindTokenizer(vocab_size=cfg.vocab_size, model_path=args.tokenizer_path)
     else:
         from unified_inference import create_inference_engine
         engine = create_inference_engine(
@@ -353,7 +367,10 @@ def cmd_serve(args):
 
     # 默认: 启动 Emind Web 服务
     import subprocess
-    subprocess.run([sys.executable or "python", "web_server.py", "--port", str(args.port)])
+    cmd = [sys.executable or "python", "web_server.py", "--port", str(args.port)]
+    if args.model:
+        cmd.extend(["--model", args.model])
+    subprocess.run(cmd)
 
 
 def cmd_eval(args):
@@ -520,6 +537,8 @@ def main():
     p.add_argument("--moe", action="store_true", help="启用 MoE（默认关闭）")
     p.add_argument("--lora", action="store_true")
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    p.add_argument("--save-steps", type=int, default=500, help="每 N 步保存一次 checkpoint")
+    p.add_argument("--logging-steps", type=int, default=10, help="每 N 步打印一次日志")
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--temperature", type=float, default=2.0)
@@ -536,6 +555,14 @@ def main():
     p.add_argument("--top-p", type=float, default=0.9)
     p.add_argument("--backend", default="cloud_api", choices=["cloud_api", "ollama", "llama_cpp", "huggingface", "vllm", "vllm_server"])
     p.add_argument("--api-key")
+    # 当 checkpoint 不含 model_config 时的架构参数（可选）
+    p.add_argument("--d-model", type=int, default=None, help="覆盖 checkpoint 中的模型维度")
+    p.add_argument("--n-heads", type=int, default=None)
+    p.add_argument("--n-kv-heads", type=int, default=None)
+    p.add_argument("--n-layers", type=int, default=None)
+    p.add_argument("--vocab-size", type=int, default=32000)
+    p.add_argument("--max-seq-len", type=int, default=2048)
+    p.add_argument("--tokenizer-path", default=None, help="SentencePiece 模型路径")
     # vLLM 参数
     p.add_argument("--no-vllm-prefix-caching", action="store_false", dest="vllm_prefix_caching", default=True, help="禁用 Prefix Caching")
     p.add_argument("--vllm-speculative", action="store_true", help="启用 Speculative Decoding")

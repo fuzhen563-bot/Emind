@@ -3,6 +3,8 @@ Emind 统一推理后端 - 支持多种模型来源
 包括：vLLM, Ollama, llama.cpp (LLM), HuggingFace Transformers, 本地模型, 亦API 云端
 """
 
+from __future__ import annotations
+
 import os
 import json
 from typing import Optional, Dict, Any, List, Generator, Callable
@@ -606,17 +608,16 @@ class LocalModelBackend(BaseBackend):
         """加载本地模型"""
         from model import create_model
 
-        model_path = self.config.model_path or "checkpoints/model_multiround_epoch4888.pt"
-        tokenizer_path = "checkpoints/tokenizer.json"
-
+        model_path = self.config.model_path
+        if not model_path:
+            print("本地模型后端: 未指定 model_path")
+            return
         if not os.path.exists(model_path):
             print(f"本地模型不存在: {model_path}")
             return
 
         # 加载分词器
         self.tokenizer = SimpleTokenizer()
-        if os.path.exists(tokenizer_path):
-            self.tokenizer.load(tokenizer_path)
 
         # 加载模型
         device = torch.device(self.config.device if torch.cuda.is_available() else "cpu")

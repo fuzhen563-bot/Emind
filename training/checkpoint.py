@@ -29,12 +29,14 @@ class CheckpointManager:
         scheduler_state: Optional[Dict[str, Any]] = None,
         metrics: Optional[Dict[str, float]] = None,
         is_best: bool = False,
+        model_config: Optional[Dict[str, Any]] = None,
     ):
         ckpt_path = self._checkpoint_path(step)
         ckpt_path.mkdir(parents=True, exist_ok=True)
         save_dict = {
             "step": step,
             "model_state_dict": model_state,
+            "model_config": model_config or {},
             "optimizer_state_dict": optimizer_state,
             "scheduler_state_dict": scheduler_state,
             "metrics": metrics or {},
@@ -86,7 +88,11 @@ class CheckpointManager:
     def _load(self, ckpt_path: Path, model, optimizer=None, scheduler=None):
         device = next(model.parameters()).device
         save_dict = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(save_dict["model_state_dict"])
+        state = save_dict["model_state_dict"]
+        # 处理 DDP/FSDP 的 module. 前缀
+        if any(k.startswith("module.") for k in state):
+            state = {k.replace("module.", ""): v for k, v in state.items()}
+        model.load_state_dict(state, strict=False)
         if optimizer and save_dict.get("optimizer_state_dict"):
             optimizer.load_state_dict(save_dict["optimizer_state_dict"])
         if scheduler and save_dict.get("scheduler_state_dict"):

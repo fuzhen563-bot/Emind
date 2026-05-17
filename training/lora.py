@@ -47,12 +47,13 @@ def apply_lora(model: EmindLM, target_modules: Optional[List[str]] = None, rank:
         if module.bias is not None:
             module.bias.requires_grad = False
 
-        def forward_with_lora(original_forward, lora_layer):
-            def new_forward(x):
-                return original_forward(x) + lora_layer(x)
-            return new_forward
+        # 保存原始 forward，供 merge_lora 恢复
+        module._original_forward = module.forward
 
-        module.forward = forward_with_lora(module.forward, lora)
+        def new_forward(x, _m=module):
+            return _m._original_forward(x) + _m.lora(x)
+
+        module.forward = new_forward
         lora_params += sum(p.numel() for p in lora.parameters())
 
     print(f"LoRA applied to {len(target_modules)} module types, {lora_params:,} trainable params")
@@ -60,12 +61,14 @@ def apply_lora(model: EmindLM, target_modules: Optional[List[str]] = None, rank:
 
 
 def merge_lora(model: EmindLM):
-    """Merge LoRA weights back into original linear layers."""
+    """Merge LoRA weights back into original linear layers and restore original forward."""
     for module in model.modules():
         if hasattr(module, "lora") and isinstance(module, nn.Linear):
             with torch.no_grad():
                 module.weight.data += (module.lora.A @ module.lora.B).T * module.lora.scaling
+            module.forward = module._original_forward
             del module.lora
+            del module._original_forward
     return model
 
 

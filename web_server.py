@@ -58,6 +58,22 @@ if os.path.exists(static_dir):
 
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "web", "templates"))
 
+# 统一推理后端
+try:
+    from unified_inference import UnifiedInferenceEngine, BackendConfig, create_inference_engine, get_cloud_api_models
+except ImportError:
+    UnifiedInferenceEngine = None  # type: ignore
+    BackendConfig = None  # type: ignore
+    create_inference_engine = None  # type: ignore
+    get_cloud_api_models = None  # type: ignore
+
+# vLLM 深度集成
+try:
+    from vllm_integration import VLLM_INTEGRATION_AVAILABLE, detect_vllm_capabilities  # type: ignore
+except ImportError:
+    VLLM_INTEGRATION_AVAILABLE = False  # type: ignore
+    detect_vllm_capabilities = None  # type: ignore
+
 # ============================================================================
 # Simple Session Middleware (no itsdangerous dependency)
 # ============================================================================
@@ -175,6 +191,46 @@ MODE_PREFIXES = {
     "/分析": "analysis",
     "/翻译": "translate",
 }
+
+# ============================================================================
+# Helpers (PRESET_RESPONSES, resolve_mode, build_prompt, estimate_tokens)
+# ============================================================================
+
+PRESET_RESPONSES = [
+    "你好！我是Emind，由亦梓科技开发的AI助手。很高兴为你服务！",
+    "这是一个很好的问题！让我从多个角度来分析一下。",
+    "让我思考一下这个问题，从我的知识库中检索相关信息...",
+    "感谢你的提问！以下是我的回答。",
+    "这个问题很有意思，我来详细解释一下。",
+]
+
+
+def resolve_mode(message: str):
+    """Detect mode prefix like '/深度思考' and return (clean_message, mode)"""
+    for prefix, mode in MODE_PREFIXES.items():
+        if message.startswith(prefix):
+            return message[len(prefix):].strip(), mode
+    return message, None
+
+
+def build_prompt(messages, system_prompt: str) -> str:
+    """Build prompt from messages list for local models"""
+    parts = [f"系统: {system_prompt}"]
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "user":
+            parts.append(f"用户: {content}")
+        elif role == "assistant":
+            parts.append(f"助手: {content}")
+    parts.append("助手:")
+    return "\n".join(parts)
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count estimate for display purposes"""
+    return len(text) * 3 // 2
+
 
 # ============================================================================
 # Thinking Simulator
@@ -347,52 +403,21 @@ class SessionManager:
 # ============================================================================
 
 session_mgr = SessionManager()
-_global_engine: Optional[UnifiedInferenceEngine] = None
-
-PRESET_RESPONSES = [
-    "你好！我是亦梓·智脑 (Emind AI) 智能助手。很高兴为你服务！",
-    "人工智能是一门研究如何让计算机模拟人类智能的学科，包括机器学习、深度学习、自然语言处理等领域。",
-    "深度学习是机器学习的一个分支，通过构建多层神经网络来学习数据的复杂特征。",
-    "Transformer 是一种基于自注意力机制的神经网络架构，广泛应用于自然语言处理任务。",
-    "机器学习是人工智能的核心技术，让计算机通过数据学习规律并做出预测或决策。",
-    "亦梓科技专注于 AI 技术研发，致力于打造新一代 AI 模型。",
-    "学习新技能的最佳方法是理论结合实践，多动手练习，多思考总结。",
-    "保持好奇心和学习热情，不断探索新的领域，这是成长的关键。",
-]
-
-MAX_HISTORY_TOKENS = 4096
-
-
-def estimate_tokens(text: str) -> int:
-    return max(1, int(len(text) * 1.3))
-
-
-def build_prompt(messages: List[Dict], system_prompt: str, max_tokens: int = MAX_HISTORY_TOKENS) -> str:
-    parts = [f"系统: {system_prompt}"]
-    total_est = estimate_tokens(system_prompt)
-    for msg in reversed(messages):
-        role = "用户" if msg["role"] == "user" else "助手"
-        line = f"{role}: {msg['content']}"
-        t = estimate_tokens(line)
-        if total_est + t > max_tokens:
-            break
-        parts.append(line)
-        total_est += t
-    parts = [parts[0]] + list(reversed(parts[1:]))
-    return "\n".join(parts) + "\n助手:"
-
-
-def resolve_mode(message: str) -> Tuple[str, Optional[str]]:
-    for prefix, mode in sorted(MODE_PREFIXES.items(), key=lambda x: -len(x[0])):
-        if message.startswith(prefix):
-            return message[len(prefix):].strip(), mode
-    return message, None
-
+_global_engine = None
 
 def get_engine() -> UnifiedInferenceEngine:
     global _global_engine
     if _global_engine is None:
-        _global_engine = create_inference_engine("cloud_api")
+        # 优先尝试加载本地 checkpoint
+        model_path = None
+        for i, arg in enumerate(sys.argv[1:]):
+            if arg == "--model" and i + 1 < len(sys.argv[1:]):
+                model_path = sys.argv[i + 2]
+                break
+        if model_path and os.path.exists(model_path):
+            _global_engine = create_inference_engine("local", model_path=model_path)
+        else:
+            _global_engine = create_inference_engine("cloud_api")
     return _global_engine
 
 
@@ -1194,16 +1219,25 @@ async def auth_status(request: Request):
 if __name__ == "__main__":
     import sys
     port = 3333
+    model_path = None
     for i, arg in enumerate(sys.argv[1:]):
         if arg == "--port" and i + 1 < len(sys.argv[1:]):
             port = int(sys.argv[i + 2])
             break
+        if arg == "--model" and i + 1 < len(sys.argv[1:]):
+            model_path = sys.argv[i + 2]
 
     print("\n" + "=" * 60)
     print("  亦梓·智脑 Emind AI Web 对话服务 v2.0")
     print("  亦梓科技 © 2026")
     print("=" * 60)
-    engine = get_engine()
+
+    if model_path and os.path.exists(model_path):
+        engine = create_inference_engine("local", model_path=model_path)
+        _global_engine = engine
+    else:
+        engine = get_engine()
+
     if engine:
         info = engine.get_backend_info()
         print(f"  后端: {info['backend_type']} | 可用: {info['is_available']}")

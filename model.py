@@ -129,12 +129,16 @@ class GroupedQueryAttention(nn.Module):
 
         new_kv_cache = (k.detach(), v.detach())
 
-        k = k.repeat_interleave(self.n_rep, dim=2)
-        v = v.repeat_interleave(self.n_rep, dim=2)
+        k = k.repeat_interleave(self.n_rep, dim=2).contiguous()
+        v = v.repeat_interleave(self.n_rep, dim=2).contiguous()
 
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
+        attn = (q @ k.transpose(-2, -1)) * (self.d_k ** -0.5)
+        if mask is not None:
+            attn = attn + mask
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+        out = attn @ v
         out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         out = self.W_o(out)
         return out, new_kv_cache
@@ -426,7 +430,8 @@ class EmindLM(nn.Module):
 
             if repetition_penalty != 1.0:
                 for b in range(batch_size):
-                    for tid in torch.unique(gen_ids[b]):
+                    gen_tokens = gen_ids[b, input_ids.shape[1]:]
+                    for tid in torch.unique(gen_tokens):
                         if tid < logits.shape[-1]:
                             if logits[b, tid] < 0:
                                 logits[b, tid] *= repetition_penalty

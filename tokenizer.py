@@ -91,7 +91,12 @@ class EmindTokenizer:
             text = self._fallback.decode(ids)
             if skip_special_tokens:
                 special_ids = {self.token_to_id(t) for t in self.special_tokens.values()}
-                return "".join(c for i, c in enumerate(text) if ord(c) not in special_ids if hasattr(self._fallback, 'itos'))
+                filtered = []
+                for i, c in enumerate(text):
+                    if isinstance(self._fallback, _FallbackTokenizer) and i < len(ids) and ids[i] in special_ids:
+                        continue
+                    filtered.append(c)
+                return "".join(filtered)
             return text
         else:
             return "".join(chr(i) for i in ids if 32 <= i < 127 or i > 127)

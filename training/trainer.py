@@ -236,6 +236,7 @@ class TrainerBase:
 
         if is_main:
             self.metrics.save(str(Path(self.config.output_dir) / self.config.experiment_name / "metrics.json"))
+            self._save()
             print(f"Training complete. {self.metrics.summary()}")
 
     def _save(self, is_best: bool = False):
@@ -249,9 +250,12 @@ class TrainerBase:
             if self.rank != 0:
                 return
 
+        import dataclasses
+        model_cfg = dataclasses.asdict(self.model.config) if hasattr(self.model, 'config') else {}
         self.checkpoint.save(
             step=self.global_step,
             model_state=model_state,
+            model_config=model_cfg,
             optimizer_state=self.optimizer.state_dict(),
             scheduler_state=self.scheduler.state_dict(),
             metrics={"train_loss": self.metrics.current_epoch.get("train_loss", 0)},

@@ -58,7 +58,7 @@ class MetricsTracker:
         last = self.history[-1]
         return (
             f"Epochs: {len(self.history)}, "
-            f"Best eval loss: {best_eval:.4f}, "
+            f"Best eval loss: {f'{best_eval:.4f}' if best_eval is not None else 'N/A'}, "
             f"Last train loss: {last.get('train_loss', 'N/A')}, "
             f"Last eval loss: {last.get('eval_loss', 'N/A')}"
         )
