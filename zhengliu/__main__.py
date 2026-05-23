@@ -1,4 +1,5 @@
 """
+<<<<<<< HEAD
 zhengliu 蒸馏工具箱 — 交互式菜单
 
 用法:
@@ -200,3 +201,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+=======
+python -m zhengliu 入口
+"""
+from zhengliu.distill import main
+main()
+>>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
