@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from contextlib import nullcontext
 from typing import List, Dict, Any, Optional, Tuple
 
 from model import EmindLM
@@ -24,6 +25,9 @@ class DPODataset(Dataset):
         chosen = item["chosen"]
         rejected = item["rejected"]
 
+        prompt_ids = self.tokenizer.encode(prompt)
+        prompt_len = len(prompt_ids)
+
         def _encode(text: str):
             ids = self.tokenizer.encode(text)[:self.max_seq_len]
             pad = [self.pad_token_id] * (self.max_seq_len - len(ids))
@@ -32,6 +36,7 @@ class DPODataset(Dataset):
         return {
             "chosen_input_ids": _encode(prompt + chosen),
             "rejected_input_ids": _encode(prompt + rejected),
+            "prompt_len": prompt_len,
         }
 
 
@@ -44,6 +49,7 @@ class DPOTrainer(TrainerBase):
         train_dataset: Dataset,
         eval_dataset: Optional[Dataset] = None,
         beta: float = 0.1,
+        label_smoothing: float = 0.0,
     ):
         super().__init__(model, config, train_dataset, eval_dataset)
         self.ref_model = ref_model
@@ -53,37 +59,56 @@ class DPOTrainer(TrainerBase):
             for p in self.ref_model.parameters():
                 p.requires_grad = False
         self.beta = beta
+        self.label_smoothing = label_smoothing
+
+    @staticmethod
+    def _log_probs(logits: torch.Tensor, input_ids: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        per_token_logps = F.log_softmax(shift_logits, dim=-1).gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+        mask = (shift_labels != pad_token_id).float()
+        return (per_token_logps * mask).sum(-1), mask.sum(-1)
+
+    @staticmethod
+    def _response_log_probs(logits: torch.Tensor, input_ids: torch.Tensor, prompt_lens: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        per_token_logps = F.log_softmax(shift_logits, dim=-1).gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+        response_mask = (shift_labels != pad_token_id).float()
+        prompt_mask = torch.arange(shift_labels.shape[1], device=shift_labels.device).unsqueeze(0) >= prompt_lens.unsqueeze(1) - 1
+        mask = response_mask * prompt_mask.float()
+        return (per_token_logps * mask).sum(-1)
 
     def compute_loss(self, batch) -> torch.Tensor:
         chosen_ids = batch["chosen_input_ids"].to(self.device)
         rejected_ids = batch["rejected_input_ids"].to(self.device)
+        prompt_lens = batch["prompt_len"].to(self.device)
+        pad_id = getattr(self.model.config, 'pad_token_id', 0)
 
-        _, chosen_logits, _ = self.model(chosen_ids)
-        _, rejected_logits, _ = self.model(rejected_ids)
+        _, chosen_logits, _, _, c_aux, _ = self.model(chosen_ids)
+        _, rejected_logits, _, _, r_aux, _ = self.model(rejected_ids)
 
-        def _log_probs(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
-            per_token_logps = F.log_softmax(shift_logits, dim=-1).gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
-            mask = (shift_labels != 0).float()
-            return (per_token_logps * mask).sum(-1)
-
-        policy_chosen_logps = _log_probs(chosen_logits, chosen_ids)
-        policy_rejected_logps = _log_probs(rejected_logits, rejected_ids)
+        policy_chosen_logps = self._response_log_probs(chosen_logits, chosen_ids, prompt_lens, pad_id)
+        policy_rejected_logps = self._response_log_probs(rejected_logits, rejected_ids, prompt_lens, pad_id)
 
         if self.ref_model is not None:
             with torch.no_grad():
-                _, ref_chosen_logits, _ = self.ref_model(chosen_ids)
-                _, ref_rejected_logits, _ = self.ref_model(rejected_ids)
-                ref_chosen_logps = _log_probs(ref_chosen_logits, chosen_ids)
-                ref_rejected_logps = _log_probs(ref_rejected_logits, rejected_ids)
+                _, ref_chosen_logits, _, _, _, _ = self.ref_model(chosen_ids)
+                _, ref_rejected_logits, _, _, _, _ = self.ref_model(rejected_ids)
+                ref_chosen_logps = self._response_log_probs(ref_chosen_logits, chosen_ids, prompt_lens, pad_id)
+                ref_rejected_logps = self._response_log_probs(ref_rejected_logits, rejected_ids, prompt_lens, pad_id)
         else:
-            ref_chosen_logps = 0
-            ref_rejected_logps = 0
+            ref_chosen_logps = torch.zeros_like(policy_chosen_logps)
+            ref_rejected_logps = torch.zeros_like(policy_rejected_logps)
 
-        chosen_diff = policy_chosen_logps - ref_chosen_logps
-        rejected_diff = policy_rejected_logps - ref_rejected_logps
-        logits_diff = self.beta * (chosen_diff - rejected_diff)
-        loss = -F.logsigmoid(logits_diff).mean()
+        chosen_ratio = policy_chosen_logps - ref_chosen_logps
+        rejected_ratio = policy_rejected_logps - ref_rejected_logps
+        logits_diff = self.beta * (chosen_ratio - rejected_ratio)
+        logits_diff = torch.clamp(logits_diff, max=50.0)
 
-        return loss
+        if self.label_smoothing > 0:
+            losses = -F.logsigmoid(logits_diff) * (1 - self.label_smoothing) - F.logsigmoid(-logits_diff) * self.label_smoothing
+        else:
+            losses = -F.logsigmoid(logits_diff)
+
+        return losses.mean() + c_aux + r_aux

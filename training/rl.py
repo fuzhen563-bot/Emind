@@ -91,13 +91,14 @@ def kl_estimate(logps: torch.Tensor, ref_logps: torch.Tensor, method: str = "kl3
     logps / ref_logps: (batch, seq_len)
     返回: (batch,) 每个样本的 KL 散度
     """
-    ratio = torch.exp(logps - ref_logps)
+    diff = (logps - ref_logps).clamp(-20, 20)
+    ratio = torch.exp(diff)
     if method == "kl1":
-        return (ref_logps - logps).mean(-1)
+        return (-diff).mean(-1)
     elif method == "kl2":
-        return (logps - ref_logps).mean(-1)
+        return diff.mean(-1)
     else:
-        return (ratio - 1 - (logps - ref_logps)).mean(-1)
+        return (ratio - 1 - diff).mean(-1)
 
 
 def masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -156,9 +157,8 @@ class RewardModel(nn.Module):
         self.base_model.requires_grad_(False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        h, _, _ = self.base_model(input_ids)
-        last_hidden = h[:, -1, :]
-        return self.reward_head(last_hidden).squeeze(-1)
+        _, _, _, _, _, last_hidden = self.base_model(input_ids)
+        return self.reward_head(last_hidden[:, -1, :].detach()).squeeze(-1)
 
 
 class RewardModelTrainer:
@@ -254,9 +254,8 @@ class PPOTrainer(TrainerBase):
         self.global_step = 0
 
     def _value(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """(batch,) 标量 value per sequence"""
-        h, _, _ = self.model(input_ids)
-        return self.value_head(h[:, -1, :]).squeeze(-1)
+        _, _, _, _, _, last_hidden = self.model(input_ids)
+        return self.value_head(last_hidden[:, -1, :]).squeeze(-1)
 
     @torch.no_grad()
     def _rollout(self, prompts: torch.Tensor, prompt_texts: List[str]) -> Dict:
@@ -268,11 +267,11 @@ class PPOTrainer(TrainerBase):
             max_new_tokens=self.config.max_seq_len // 2,
         )
 
-        _, logits, _ = self.model(sequences)
+        _, logits, _, _, aux_rollout, _ = self.model(sequences)
         policy_logps = compute_token_logps(logits, sequences)
 
         if self.ref_model is not None:
-            _, ref_logits, _ = self.ref_model(sequences)
+            _, ref_logits, _, _, _, _ = self.ref_model(sequences)
             ref_logps = compute_token_logps(ref_logits, sequences)
         else:
             ref_logps = None
@@ -366,7 +365,7 @@ class PPOTrainer(TrainerBase):
                 mask = self._response_mask(seq.size(1), plen, bs)
 
                 for _ in range(self.config.ppo_epochs):
-                    _, logits, _ = self.model(seq)
+                    _, logits, _, _, _, _ = self.model(seq)
                     policy_logps = compute_token_logps(logits, seq)
                     values = self._value(seq)
 
@@ -461,11 +460,11 @@ class GRPOTrainer:
             max_new_tokens=self.config.max_seq_len // 2,
         )
 
-        _, logits, _ = self.model(sequences)
+        _, logits, _, _, _, _ = self.model(sequences)
         policy_logps = compute_token_logps(logits, sequences)
 
         if self.ref_model is not None:
-            _, ref_logits, _ = self.ref_model(sequences)
+            _, ref_logits, _, _, _, _ = self.ref_model(sequences)
             ref_logps = compute_token_logps(ref_logits, sequences)
         else:
             ref_logps = None

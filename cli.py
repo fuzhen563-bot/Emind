@@ -99,6 +99,7 @@ def cmd_rl(args):
 
 
 def cmd_train(args):
+    import torch
     from model import EmindConfig, create_model
     from tokenizer import EmindTokenizer
     from training import SFTTrainer, DPOTrainer, DistillationTrainer, TrainingConfig, SFTDataset, DPODataset, DistillationDataset, apply_lora
@@ -133,22 +134,61 @@ def cmd_train(args):
         mode=args.mode, epochs=args.epochs, batch_size=args.batch_size,
         learning_rate=args.lr, output_dir=args.output_dir,
         max_seq_len=args.max_seq_len, use_bf16=True,
+        compile_model=args.compile, neftune_noise_alpha=args.neftune, optimizer=args.optimizer,
+        curriculum_stages=args.curriculum_stages, replay_ratio=args.replay_ratio,
         use_fsdp=args.use_fsdp,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
     )
 
+    if args.resume and os.path.exists(args.resume):
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        resume_cfg = resume_ckpt.get("model_config", {})
+        if resume_cfg:
+            for k, v in resume_cfg.items():
+                if not hasattr(cfg, k) or getattr(cfg, k) == EmindConfig.__dataclass_fields__[k].default:
+                    setattr(cfg, k, v)
+        print(f"[train] Config aligned to checkpoint (d_ff={cfg.d_ff}, vocab_size={cfg.vocab_size})")
+
     if args.mode in ("sft", "pretrain"):
-        dataset = SFTDataset(raw_data, tokenizer, max_seq_len=args.max_seq_len)
+        if args.curriculum_stages > 1 or args.replay_ratio > 0:
+            from training.curriculum import CurriculumDataset
+            replay_raw = []
+            if args.replay_data and os.path.exists(args.replay_data):
+                with open(args.replay_data, encoding="utf-8") as f:
+                    replay_raw = [json.loads(line) for line in f if line.strip()]
+            dataset = CurriculumDataset(
+                raw_data, tokenizer, max_seq_len=args.max_seq_len,
+                stages=args.curriculum_stages, replay_data=replay_raw, replay_ratio=args.replay_ratio,
+            )
+        else:
+            dataset = SFTDataset(raw_data, tokenizer, max_seq_len=args.max_seq_len)
         model = create_model(cfg)
         if args.lora:
             apply_lora(model, rank=args.lora_rank)
+        if args.resume and os.path.exists(args.resume):
+            state = resume_ckpt.get("model_state_dict", resume_ckpt)
+            model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
+            print(f"[SFT] Resumed from {args.resume}")
         trainer = SFTTrainer(model, train_cfg, dataset)
     elif args.mode == "dpo":
         dataset = DPODataset(raw_data, tokenizer, max_seq_len=args.max_seq_len)
         model = create_model(cfg)
-        trainer = DPOTrainer(model, None, train_cfg, dataset, beta=args.beta)
+        if args.lora:
+            apply_lora(model, rank=args.lora_rank)
+        if args.resume and os.path.exists(args.resume):
+            state = resume_ckpt.get("model_state_dict", resume_ckpt)
+            model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
+            print(f"[DPO] Policy model loaded from {args.resume}")
+            ref_model = create_model(cfg)
+            ref_model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
+            print("[DPO] Reference model copied from checkpoint (frozen)")
+        else:
+            ref_model = create_model(cfg)
+            ref_model.load_state_dict(model.state_dict())
+            print("[DPO] Reference model copied from policy (same init)")
+        trainer = DPOTrainer(model, ref_model, train_cfg, dataset, beta=args.dpo_beta, label_smoothing=args.label_smoothing)
     elif args.mode == "distill":
         dataset = DistillationDataset(raw_data, tokenizer, max_seq_len=args.max_seq_len)
         student = create_model(cfg)
@@ -248,7 +288,11 @@ def cmd_infer(args):
                 vocab_size=args.vocab_size or 32000,
                 max_seq_len=args.max_seq_len or 2048,
             )
+        if "d_ff" not in cfg_dict:
+            cfg_dict["d_ff"] = cfg_dict.get("d_model", 4096) * 4
         cfg = EmindConfig.from_dict(cfg_dict)
+        if args.kv_quant:
+            cfg.use_kv_quant = True
         model = create_model(cfg)
         state = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
@@ -294,7 +338,17 @@ def cmd_infer(args):
 
     if args.prompt:
         ids = torch.tensor([tokenizer.encode(args.prompt, add_bos=True)], device=device)
-        out = model.generate(ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_p=args.top_p)
+        if args.speculative:
+            out = model.generate_speculative(ids, max_new_tokens=args.max_new_tokens,
+                                              temperature=args.temperature, draft_layers=args.spec_draft_layers,
+                                              gamma=args.spec_gamma)
+        elif args.beam > 0:
+            out = model.generate_beam(ids, max_new_tokens=args.max_new_tokens, num_beams=args.beam,
+                                       length_penalty=args.length_penalty)
+        else:
+            out = model.generate(ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+                                 top_p=args.top_p, use_dola=args.dola, dola_gamma=args.dola_gamma,
+                                 min_p=args.min_p)
         print(tokenizer.decode(out[0].tolist()))
 
     if args.interactive:
@@ -304,7 +358,17 @@ def cmd_infer(args):
             if p.lower() in ("quit", "exit", "q"):
                 break
             ids = torch.tensor([tokenizer.encode(p, add_bos=True)], device=device)
-            out = model.generate(ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_p=args.top_p)
+            if args.speculative:
+                out = model.generate_speculative(ids, max_new_tokens=args.max_new_tokens,
+                                                  temperature=args.temperature, draft_layers=args.spec_draft_layers,
+                                                  gamma=args.spec_gamma)
+            elif args.beam > 0:
+                out = model.generate_beam(ids, max_new_tokens=args.max_new_tokens, num_beams=args.beam,
+                                           length_penalty=args.length_penalty)
+            else:
+                out = model.generate(ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+                                     top_p=args.top_p, use_dola=args.dola, dola_gamma=args.dola_gamma,
+                                     min_p=args.min_p)
             print(tokenizer.decode(out[0].tolist()))
 
 
@@ -541,9 +605,18 @@ def main():
     p.add_argument("--logging-steps", type=int, default=10, help="每 N 步打印一次日志")
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--beta", type=float, default=0.1)
+    p.add_argument("--dpo-beta", type=float, default=0.1, help="DPO beta temperature")
+    p.add_argument("--label-smoothing", type=float, default=0.0, help="DPO label smoothing")
     p.add_argument("--temperature", type=float, default=2.0)
+    p.add_argument("--compile", action="store_true", help="启用 torch.compile 加速 (PyTorch 2.x)")
+    p.add_argument("--neftune", type=float, default=0.0, help="NEFTune 噪声强度 (推荐 5.0)")
+    p.add_argument("--curriculum-stages", type=int, default=1, help="课程学习阶段数 (按长度排序)")
+    p.add_argument("--replay-ratio", type=float, default=0.0, help="Replay Buffer 比例 (防退化)")
+    p.add_argument("--replay-data", default=None, help="Replay Buffer 数据文件 (JSONL)")
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "adafactor"], help="优化器类型")
     p.add_argument("--use-fsdp", action="store_true")
     p.add_argument("--tokenizer-path", default=None, help="SentencePiece 模型路径")
+    p.add_argument("--resume", default=None, help="从 checkpoint 恢复训练 (SFT/DPO)")
 
     # infer
     p = sub.add_parser("infer", help="推理")
@@ -575,6 +648,15 @@ def main():
     p.add_argument("--vllm-lora", action="store_true", help="启用 LoRA")
     p.add_argument("--vllm-lora-dir", default=None, help="LoRA 模块目录")
     # 量化推理
+    p.add_argument("--dola", action="store_true", help="启用 DoLa 对比解码抑制幻觉")
+    p.add_argument("--dola-gamma", type=float, default=0.5, help="DoLa 对比强度")
+    p.add_argument("--min-p", type=float, default=0.0, help="Min-p 采样阈值 (如 0.05)")
+    p.add_argument("--beam", type=int, default=0, help="Beam Search 宽度 (0=禁用)")
+    p.add_argument("--length-penalty", type=float, default=1.0, help="Beam Search 长度惩罚")
+    p.add_argument("--speculative", action="store_true", help="启用 Speculative Decoding")
+    p.add_argument("--spec-gamma", type=int, default=4, help="Speculative gamma 值")
+    p.add_argument("--spec-draft-layers", type=int, default=2, help="Draft 模型层数")
+    p.add_argument("--kv-quant", action="store_true", help="KV Cache INT8 量化 (省显存)")
     p.add_argument("--quantize", default=None, choices=["int4", "fp8"], help="量化模式 (int4=权重 INT4, fp8=需要 H100)")
     p.add_argument("--quantize-groups", type=int, default=128, help="INT4 量化组大小")
 

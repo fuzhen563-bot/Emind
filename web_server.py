@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import os
+import glob
 import random
 import threading
 import hmac
@@ -780,7 +781,7 @@ async def list_backends():
         backends.append({"type": "huggingface", "name": "HuggingFace", "available": True, "models": [], "description": "HuggingFace Transformers 模型"})
     except:
         backends.append({"type": "huggingface", "name": "HuggingFace", "available": False, "models": [], "description": "HuggingFace Transformers 模型"})
-    local_available = os.path.exists("checkpoints/model_multiround_epoch4888.pt")
+    local_available = bool(glob.glob("checkpoints/**/*.pt", recursive=True))
     backends.append({"type": "local", "name": "本地模型", "available": local_available, "models": ["Emind Model"] if local_available else [], "description": "Emind 本地训练模型"})
 
     engine = get_engine()

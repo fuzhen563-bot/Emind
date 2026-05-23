@@ -39,6 +39,10 @@ class TrainerBase:
 
         self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+        if config.activation_checkpointing:
+            self.model.config.activation_checkpointing = True
+        if config.compile_model and hasattr(torch, 'compile'):
+            self.model = torch.compile(self.model, mode=config.compile_mode)
         if config.use_fsdp:
             self._wrap_fsdp()
 
@@ -77,14 +81,20 @@ class TrainerBase:
         except ImportError as e:
             print(f"FSDP not available ({e}), falling back to DDP")
 
-    def _create_optimizer(self) -> AdamW:
+    def _create_optimizer(self):
         params = [p for p in self.model.parameters() if p.requires_grad]
+        if self.config.optimizer == "adafactor":
+            from torch.optim import Adafactor
+            return Adafactor(params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay,
+                             scale_parameter=False, relative_step=False, warmup_init=False)
+        fused = self.config.use_fused_adam and torch.cuda.is_available()
         return AdamW(
             params,
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             betas=(self.config.adam_beta1, self.config.adam_beta2),
             eps=self.config.adam_epsilon,
+            fused=fused,
         )
 
     def _create_scheduler(self) -> LambdaLR:
@@ -138,6 +148,8 @@ class TrainerBase:
         raise NotImplementedError
 
     def training_step(self, batch: Any) -> torch.Tensor:
+        if self.config.neftune_noise_alpha > 0:
+            self.model.apply_neftune_noise(self.config.neftune_noise_alpha)
         loss = self.compute_loss(batch)
         if self.config.gradient_accumulation_steps > 1:
             loss = loss / self.config.gradient_accumulation_steps
@@ -233,6 +245,14 @@ class TrainerBase:
                 self.metrics.end_epoch(epoch, avg_epoch_loss)
                 epoch_time = time.time() - epoch_start
                 print(f"Epoch {epoch+1} completed in {epoch_time:.1f}s | Avg loss: {avg_epoch_loss:.4f}")
+
+            if hasattr(self.train_dataset, 'advance_stage') and (epoch + 1) % max(1, self.config.epochs // self.config.curriculum_stages) == 0:
+                if self.train_dataset.advance_stage():
+                    if is_main:
+                        start, end = self.train_dataset.get_stage_data()
+                        print(f"  >>> Curriculum: stage {self.train_dataset.current_stage}/{self.train_dataset.num_stages} (samples {start}-{end})")
+                    train_loader = self.train_dataloader()
+                    total_batches = len(train_loader)
 
         if is_main:
             self.metrics.save(str(Path(self.config.output_dir) / self.config.experiment_name / "metrics.json"))

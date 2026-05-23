@@ -55,25 +55,26 @@ class DistillationTrainer(TrainerBase):
         input_ids = batch["input_ids"].to(self.device)
         labels = batch["labels"].to(self.device)
 
-        _, student_logits, _ = self.model(input_ids)
+        _, student_logits, _, _, s_aux, _ = self.model(input_ids)
 
         with torch.no_grad():
-            _, teacher_logits, _ = self.teacher_model(input_ids)
+            _, teacher_logits, _, _, _, _ = self.teacher_model(input_ids)
 
         vocab_size = student_logits.shape[-1]
         shift_student = student_logits[:, :-1, :].contiguous()
         shift_teacher = teacher_logits[:, :-1, :].contiguous()
         shift_labels = labels[:, 1:].contiguous()
-        mask = (shift_labels != 0).float().unsqueeze(-1)
+        pad_id = self.model.config.pad_token_id
+        mask = (shift_labels != pad_id).float().unsqueeze(-1)
 
         loss_clm = F.cross_entropy(
             shift_student.view(-1, vocab_size),
             shift_labels.view(-1),
-            ignore_index=0,
+            ignore_index=pad_id,
         )
 
         log_softmax_s = F.log_softmax(shift_student / self.temperature, dim=-1)
         softmax_t = F.softmax(shift_teacher / self.temperature, dim=-1)
         loss_ce = -(log_softmax_s * softmax_t * mask).sum(-1).mean() * (self.temperature ** 2)
 
-        return self.alpha_clm * loss_clm + self.alpha_ce * loss_ce
+        return self.alpha_clm * loss_clm + self.alpha_ce * loss_ce + s_aux

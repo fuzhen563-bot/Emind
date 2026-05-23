@@ -49,25 +49,35 @@ class EmindTokenizer:
 
     def train(self, corpus_path: str, model_prefix: str = "emind_tokenizer"):
         import sentencepiece as spm
-        spm.SentencePieceTrainer.train(
-            input=corpus_path,
-            model_prefix=model_prefix,
-            vocab_size=self.vocab_size,
-            character_coverage=0.9995,
-            model_type="bpe",
-            pad_id=0,
-            unk_id=1,
-            bos_id=2,
+        try:
+            spm.SentencePieceTrainer.train(
+                input=corpus_path,
+                model_prefix=model_prefix,
+                vocab_size=self.vocab_size,
+                character_coverage=0.9995,
+                model_type="bpe",
+                pad_id=0,
+                unk_id=1,
+                bos_id=2,
             eos_id=3,
             pad_piece=self.special_tokens["pad"],
             unk_piece=self.special_tokens["unk"],
             bos_piece=self.special_tokens["bos"],
             eos_piece=self.special_tokens["eos"],
             user_defined_symbols="<|im_start|>,<|im_end|>,<|tool_call|>,<|tool_result|>",
-        )
-        self._sp = spm.SentencePieceProcessor()
-        self._sp.Load(f"{model_prefix}.model")
-        self._fallback = None
+            )
+            self._sp = spm.SentencePieceProcessor()
+            self._sp.Load(f"{model_prefix}.model")
+            self._fallback = None
+        except RuntimeError as e:
+            err_msg = str(e)
+            if "Vocabulary size too high" in err_msg or "vocab_size" in err_msg.lower():
+                import re
+                limits = re.findall(r'\d+', err_msg)
+                limit = limits[-1] if limits else "?"
+                print(f"\n[ERROR] vocab_size={self.vocab_size} 超出语料能支持的上限 (max {limit})")
+                print(f"  建议: --vocab-size {limit}  或增加蒸馏数据量")
+            raise
 
     def encode(self, text: str, add_bos: bool = True, add_eos: bool = False) -> List[int]:
         if self._sp is not None:

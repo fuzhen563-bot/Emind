@@ -1,3 +1,4 @@
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -79,7 +80,7 @@ class RMSNorm(nn.Module):
 # =============================================================================
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float = 0.1, max_seq_len: int = 4096, qk_norm: bool = False):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float = 0.1, max_seq_len: int = 4096, qk_norm: bool = False, use_kv_quant: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         assert n_heads % n_kv_heads == 0
@@ -90,6 +91,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_rep = n_heads // n_kv_heads
         self.d_k = d_model // n_heads
         self.dropout = dropout
+        self.use_kv_quant = use_kv_quant
 
         self.W_q = nn.Linear(d_model, d_model, bias=False)
         self.W_k = nn.Linear(d_model, n_kv_heads * self.d_k, bias=False)
@@ -101,6 +103,20 @@ class GroupedQueryAttention(nn.Module):
             self.k_norm = RMSNorm(n_kv_heads * self.d_k)
         else:
             self.q_norm = self.k_norm = None
+
+    @staticmethod
+    def quantize_kv(k: torch.Tensor, v: torch.Tensor):
+        if k.numel() < 256:
+            return k, v, None, None
+        k_scale = k.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / 127.0
+        v_scale = v.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8) / 127.0
+        k_q = (k.float() / k_scale).round().clamp(-127, 127).to(torch.int8)
+        v_q = (v.float() / v_scale).round().clamp(-127, 127).to(torch.int8)
+        return k_q, v_q, k_scale, v_scale
+
+    @staticmethod
+    def dequantize_kv(k_q, v_q, k_scale, v_scale):
+        return k_q.float() * k_scale, v_q.float() * v_scale
 
     def forward(
         self,
@@ -124,21 +140,24 @@ class GroupedQueryAttention(nn.Module):
 
         if kv_cache is not None:
             k_cache, v_cache = kv_cache
+            if self.use_kv_quant and k_cache.dtype == torch.int8:
+                k_cache, v_cache = self.dequantize_kv(k_cache, v_cache, *kv_cache[2:4])
             k = torch.cat([k_cache, k], dim=1)
             v = torch.cat([v_cache, v], dim=1)
 
-        new_kv_cache = (k.detach(), v.detach())
+        if self.use_kv_quant and not self.training:
+            k_q, v_q, k_s, v_s = self.quantize_kv(k, v)
+            new_kv_cache = (k_q, v_q, k_s, v_s)
+        else:
+            new_kv_cache = (k.detach(), v.detach())
 
         k = k.repeat_interleave(self.n_rep, dim=2).contiguous()
         v = v.repeat_interleave(self.n_rep, dim=2).contiguous()
 
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) * (self.d_k ** -0.5)
-        if mask is not None:
-            attn = attn + mask
-        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = attn @ v
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(mask is None),
+                                              dropout_p=self.dropout if self.training else 0.0)
         out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         out = self.W_o(out)
         return out, new_kv_cache
@@ -214,10 +233,11 @@ class TransformerBlock(nn.Module):
                  dropout: float = 0.1, max_seq_len: int = 4096,
                  qk_norm: bool = False, parallel_attn_ffn: bool = False,
                  use_moe: bool = False, n_experts: int = 8,
-                 n_active_experts: int = 2, moe_aux_loss_coef: float = 0.01):
+                 n_active_experts: int = 2, moe_aux_loss_coef: float = 0.01,
+                 use_kv_quant: bool = False):
         super().__init__()
         self.parallel = parallel_attn_ffn
-        self.attention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout, max_seq_len, qk_norm=qk_norm)
+        self.attention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout, max_seq_len, qk_norm=qk_norm, use_kv_quant=use_kv_quant)
         if use_moe:
             self.feed_forward = MoEFFN(d_model, d_ff, n_experts, n_active_experts, dropout, moe_aux_loss_coef)
         else:
@@ -280,8 +300,14 @@ class EmindConfig:
     n_experts: int = 8
     n_active_experts: int = 2
     moe_aux_loss_coef: float = 0.01
+    # KV Cache
+    use_kv_quant: bool = False
     # YaRN
     original_max_len: int = 4096
+
+    def __post_init__(self):
+        assert self.d_model % self.n_heads == 0, f"d_model({self.d_model}) must be divisible by n_heads({self.n_heads})"
+        assert self.n_heads % self.n_kv_heads == 0, f"n_heads({self.n_heads}) must be divisible by n_kv_heads({self.n_kv_heads})"
 
     @classmethod
     def from_dict(cls, d: dict) -> "EmindConfig":
@@ -305,12 +331,12 @@ class EmindLM(nn.Module):
                 use_moe=config.use_moe, n_experts=config.n_experts,
                 n_active_experts=config.n_active_experts,
                 moe_aux_loss_coef=config.moe_aux_loss_coef,
+                use_kv_quant=config.use_kv_quant,
             )
             for _ in range(config.n_layers)
         ])
         self.ln_f = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.lm_head.weight = self.token_embedding.weight
 
         scale = config.rope_scaling_factor if config.rope_scaling_type else 1.0
         if config.rope_scaling_type == "yarn":
@@ -332,6 +358,7 @@ class EmindLM(nn.Module):
         self.register_buffer("rope_sin", sin, persistent=False)
 
         self._init_weights()
+        self.lm_head.weight = self.token_embedding.weight
 
     def _init_weights(self):
         for m in self.modules():
@@ -351,6 +378,7 @@ class EmindLM(nn.Module):
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         kv_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        output_hidden_states: bool = False,
     ):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -359,6 +387,7 @@ class EmindLM(nn.Module):
         cos, sin = self.rope_cos.to(device), self.rope_sin.to(device)
         mask = self.create_causal_mask(seq_len, device)
 
+        hidden_states = [] if output_hidden_states else None
         new_caches = []
         use_ckpt = self.training and self.config.activation_checkpointing
         aux_loss_total = torch.tensor(0.0, device=device)
@@ -372,6 +401,8 @@ class EmindLM(nn.Module):
                 x, new_cache, aux_loss = layer(x, cos, sin, mask, cache)
             new_caches.append(new_cache)
             aux_loss_total = aux_loss_total + aux_loss
+            if output_hidden_states:
+                hidden_states.append(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -379,9 +410,226 @@ class EmindLM(nn.Module):
         loss = None
         if labels is not None:
             loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1), ignore_index=self.config.pad_token_id)
-            loss = loss + aux_loss_total
 
-        return loss, logits, new_caches
+        return loss, logits, new_caches, hidden_states if output_hidden_states else None, aux_loss_total, x
+
+    def apply_neftune_noise(self, noise_alpha: float = 5.0):
+        if not self.training:
+            return
+        eps = noise_alpha / (self.config.d_model ** 0.5)
+        with torch.no_grad():
+            embed = self.token_embedding
+            noise = torch.randn_like(embed.weight) * eps
+            embed.weight.add_(noise)
+
+    @torch.no_grad()
+    def generate_beam(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 256,
+        num_beams: int = 4,
+        length_penalty: float = 1.0,
+        early_stopping: bool = False,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        self.eval()
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+        vocab_size = self.config.vocab_size
+
+        cos, sin = self.rope_cos.to(device), self.rope_sin.to(device)
+        beam_scores = torch.zeros(batch_size, num_beams, device=device)
+        beam_scores[:, 1:] = -1e9
+        beam_scores = beam_scores.view(-1)
+
+        done = torch.zeros(batch_size * num_beams, dtype=torch.bool, device=device)
+        kv_caches = [None] * len(self.layers)
+        gen_ids = input_ids.repeat_interleave(num_beams, dim=0)
+
+        for step in range(max_new_tokens):
+            if done.all():
+                break
+
+            _, logits, kv_caches, _, _, _ = self(gen_ids, kv_caches=None if step == 0 else kv_caches)
+            logits = logits[:, -1, :] / 1.0
+            log_probs = F.log_softmax(logits, dim=-1)
+            vocab_log_probs = log_probs + beam_scores.unsqueeze(-1)
+            vocab_log_probs[done.unsqueeze(-1).expand_as(vocab_log_probs)] = float('-inf')
+
+            if step == 0:
+                topk_log_probs, topk_indices = vocab_log_probs[0::num_beams].topk(num_beams * 2, dim=-1)
+            else:
+                topk_log_probs, topk_indices = vocab_log_probs.view(batch_size, -1).topk(num_beams * 2, dim=-1)
+
+            topk_beam_indices = topk_indices // vocab_size
+            topk_token_indices = topk_indices % vocab_size
+
+            new_beam_scores = topk_log_probs.flatten()[:batch_size * num_beams]
+            new_token_ids = topk_token_indices.flatten()[:batch_size * num_beams]
+            new_beam_indices = topk_beam_indices.flatten()[:batch_size * num_beams]
+
+            gen_ids = gen_ids.view(batch_size, num_beams, -1)
+            gen_ids = gen_ids.gather(1, new_beam_indices.view(batch_size, num_beams, 1, 1).expand(-1, -1, -1, gen_ids.shape[-1]))
+            gen_ids = gen_ids.view(batch_size * num_beams, -1)
+            gen_ids = torch.cat([gen_ids, new_token_ids.view(-1, 1)], dim=-1)
+
+            # KV cache 重排 — 同步 beam 重组
+            idx = new_beam_indices  # (batch * num_beams,)
+            for li in range(len(kv_caches)):
+                if kv_caches[li] is not None:
+                    c = kv_caches[li]
+                    k, v = c[0][idx], c[1][idx]
+                    if len(c) >= 4 and c[2] is not None:
+                        kv_caches[li] = (k, v, c[2][idx], c[3][idx])
+                    else:
+                        kv_caches[li] = (k, v)
+
+            beam_scores = new_beam_scores
+            done |= (new_token_ids.view(-1) == eos_token_id)
+            if early_stopping and done.any():
+                break
+
+        gen_ids = gen_ids.view(batch_size, num_beams, -1)
+        beam_scores = beam_scores.view(batch_size, num_beams)
+        if length_penalty != 1.0:
+            lengths = (gen_ids != self.config.pad_token_id).sum(dim=-1).float()
+            beam_scores = beam_scores / (lengths ** length_penalty)
+        best_beams = beam_scores.argmax(dim=-1)
+        return gen_ids[torch.arange(batch_size, device=device), best_beams]
+
+    @torch.no_grad()
+    def generate_speculative(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 256,
+        temperature: float = 0.8,
+        draft_layers: int = 2,
+        gamma: int = 4,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        self.eval()
+        eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+
+        def _clone_cache(cache):
+            if cache is None:
+                return None
+            if len(cache) == 2:
+                return (cache[0].clone(), cache[1].clone())
+            return (cache[0].clone(), cache[1].clone(), cache[2], cache[3])
+
+        def _trim_cache(cache, keep_len):
+            if cache is None:
+                return None
+            k = cache[0][:, :keep_len]
+            v = cache[1][:, :keep_len]
+            if len(cache) == 2:
+                return (k, v)
+            return (k, v, cache[2][:, :keep_len] if cache[2] is not None else None,
+                    cache[3][:, :keep_len] if cache[3] is not None else None)
+
+        cos, sin = self.rope_cos.to(device), self.rope_sin.to(device)
+        gen_ids = input_ids.clone()
+        kv_caches = [None] * len(self.layers)
+        done = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        is_prefill = True
+
+        while gen_ids.shape[1] - input_ids.shape[1] < max_new_tokens:
+            if done.all():
+                break
+
+            cur_len = gen_ids.shape[1]
+            new_token = gen_ids[:, -1:] if cur_len > input_ids.shape[1] else gen_ids
+
+            if is_prefill:
+                mask = self.create_causal_mask(cur_len, device)
+            else:
+                mask = torch.zeros(1, 1, 1, cur_len, device=device)
+
+            cos_step = cos[max(0, cur_len - new_token.shape[1]):cur_len]
+            sin_step = sin[max(0, cur_len - new_token.shape[1]):cur_len]
+
+            # 保存原始 cache
+            saved_caches = [_clone_cache(c) for c in kv_caches]
+
+            # Draft: 用独立 cache (clone 自原始)
+            draft_caches = [_clone_cache(saved_caches[i]) for i in range(draft_layers)]
+            x_draft = self.token_embedding(new_token)
+            for i in range(draft_layers):
+                x_draft, dc, _ = self.layers[i](x_draft, cos_step, sin_step, mask, draft_caches[i])
+                draft_caches[i] = dc
+
+            draft_logits = self.lm_head(self.ln_f(x_draft[:, -1:, :])).squeeze(1)
+            draft_probs = F.softmax(draft_logits / temperature, dim=-1)
+            draft_tokens = [torch.multinomial(draft_probs, num_samples=1)]
+
+            for _ in range(gamma - 1):
+                x_d = self.token_embedding(draft_tokens[-1])
+                for i in range(draft_layers):
+                    x_d, dc, _ = self.layers[i](x_d, cos_step, sin_step, mask, draft_caches[i])
+                    draft_caches[i] = dc
+                d_logits = self.lm_head(self.ln_f(x_d[:, -1:, :])).squeeze(1)
+                d_probs = F.softmax(d_logits / temperature, dim=-1)
+                draft_tokens.append(torch.multinomial(d_probs, num_samples=1))
+
+            draft_seq = torch.cat(draft_tokens, dim=-1)
+
+            # 验证: 用原始 cache 的独立副本
+            verify_caches = [_clone_cache(saved_caches[i]) for i in range(len(self.layers))]
+            x_verify = self.token_embedding(torch.cat([new_token, draft_seq], dim=1))
+            for i in range(len(self.layers)):
+                x_verify, vc, _ = self.layers[i](x_verify, cos, sin, mask, verify_caches[i])
+                verify_caches[i] = vc
+
+            full_logits = self.lm_head(self.ln_f(x_verify))
+            full_probs = F.softmax(full_logits[:, :new_token.shape[1]:, :] / temperature, dim=-1)
+            draft_probs_base = F.softmax(draft_logits, dim=-1)
+
+            # 逐 token 接受/拒绝
+            accepted = 0
+            for n in range(gamma):
+                if accepted >= gamma:
+                    break
+                # draft_seq[0, n] 是第 n 个 draft token
+                # full_probs[0, n] 是验证模型对该位置的概率分布
+                p_m = full_probs[0, n, draft_seq[0, n]].item()
+                p_d = draft_probs_base[0, draft_seq[0, n]].item() if n == 0 else d_probs[0, draft_seq[0, n]].item()
+                if torch.rand(1, device=device).item() < min(1.0, p_m / max(p_d, 1e-8)):
+                    accepted += 1
+                else:
+                    # 拒绝: 从残差分布采样修正 token
+                    p_res = full_probs[0, n] - (draft_probs_base[0] if n == 0 else d_probs[0])
+                    p_res = p_res.clamp(min=0)
+                    p_res = p_res / (p_res.sum() + 1e-8)
+                    correction = torch.multinomial(p_res, num_samples=1).unsqueeze(0)
+                    gen_ids = torch.cat([gen_ids, correction], dim=1)
+                    break
+
+            # 更新主 cache
+            if accepted > 0:
+                keep_len = cur_len + accepted
+                keep_len = min(keep_len, verify_caches[0][0].shape[1]) if verify_caches[0] is not None else keep_len
+                for i in range(len(self.layers)):
+                    kv_caches[i] = _trim_cache(verify_caches[i], keep_len)
+            elif accepted == 0 and saved_caches[0] is not None:
+                for i in range(len(self.layers)):
+                    kv_caches[i] = _clone_cache(saved_caches[i])
+
+            gen_ids = torch.cat([gen_ids, draft_seq[:, :accepted]], dim=1)
+
+            is_prefill = False
+
+            for t in draft_seq[0, :accepted]:
+                if t == eos_token_id:
+                    done[:] = True
+                    break
+            if done.any():
+                break
+
+        return gen_ids
 
     @torch.no_grad()
     def generate(
@@ -393,6 +641,10 @@ class EmindLM(nn.Module):
         top_p: float = 0.9,
         repetition_penalty: float = 1.0,
         eos_token_id: Optional[int] = None,
+        use_dola: bool = False,
+        dola_gamma: float = 0.5,
+        dola_premature_layer_ratio: float = 0.5,
+        min_p: float = 0.0,
     ) -> torch.Tensor:
         self.eval()
         eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
@@ -403,30 +655,53 @@ class EmindLM(nn.Module):
         gen_ids = input_ids.clone()
 
         kv_caches = [None] * len(self.layers)
+        done = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        n_layers = len(self.layers)
+        prem_layer = int(n_layers * dola_premature_layer_ratio) if use_dola else -1
+        prem_layer = max(0, min(n_layers - 2, prem_layer))
 
         for _ in range(max_new_tokens):
-            cur_len = gen_ids.shape[1]
-            if cur_len == input_ids.shape[1]:
-                x = self.token_embedding(gen_ids)
-                mask = self.create_causal_mask(cur_len, device)
-                new_caches = []
-                for i, layer in enumerate(self.layers):
-                    x, new_cache, _ = layer(x, cos, sin, mask, kv_caches[i])
-                    new_caches.append(new_cache)
-                kv_caches = new_caches
-            else:
-                x = self.token_embedding(gen_ids[:, -1:])
-                mask = torch.ones(1, 1, 1, 1, device=device)
-                cos_step = cos[cur_len - 1:cur_len]
-                sin_step = sin[cur_len - 1:cur_len]
-                new_caches = []
-                for i, layer in enumerate(self.layers):
-                    x, new_cache, _ = layer(x, cos_step, sin_step, mask, kv_caches[i])
-                    new_caches.append(new_cache)
-                kv_caches = new_caches
+            active = ~done
+            if not active.any():
+                break
 
-            x = self.ln_f(x)
-            logits = self.lm_head(x[:, -1:, :]).squeeze(1)
+            cur_len = gen_ids.shape[1]
+            is_prefill = cur_len == input_ids.shape[1]
+
+            if is_prefill:
+                if use_dola:
+                    _, _, kv_caches, hs, _, _ = self(gen_ids, output_hidden_states=True)
+                else:
+                    x = self.token_embedding(gen_ids)
+                    mask = self.create_causal_mask(cur_len, device)
+                    new_caches = []
+                    for i, layer in enumerate(self.layers):
+                        x, new_cache, _ = layer(x, cos, sin, mask, kv_caches[i])
+                        new_caches.append(new_cache)
+                    kv_caches = new_caches
+            else:
+                if use_dola:
+                    _, _, kv_caches, hs, _, _ = self(gen_ids[:, -1:], kv_caches=kv_caches, output_hidden_states=True)
+                else:
+                    x = self.token_embedding(gen_ids[:, -1:])
+                    mask = torch.zeros(1, 1, 1, cur_len, device=device)
+                    cos_step = cos[cur_len - 1:cur_len]
+                    sin_step = sin[cur_len - 1:cur_len]
+                    new_caches = []
+                    for i, layer in enumerate(self.layers):
+                        x, new_cache, _ = layer(x, cos_step, sin_step, mask, kv_caches[i])
+                        new_caches.append(new_cache)
+                    kv_caches = new_caches
+
+            if use_dola:
+                mature_hidden = hs[-1]
+                prem_hidden = hs[prem_layer]
+                mature_logits = self.lm_head(self.ln_f(mature_hidden[:, -1:, :])).squeeze(1)
+                prem_logits = self.lm_head(self.ln_f(prem_hidden[:, -1:, :])).squeeze(1)
+                logits = mature_logits - dola_gamma * prem_logits
+            else:
+                x = self.ln_f(x)
+                logits = self.lm_head(x[:, -1:, :]).squeeze(1)
 
             if repetition_penalty != 1.0:
                 for b in range(batch_size):
@@ -447,16 +722,22 @@ class EmindLM(nn.Module):
             if top_p is not None and top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_mask = cum_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+                sorted_mask = cum_probs > top_p
+                sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+                sorted_mask[..., 0] = 0
                 sorted_logits[sorted_mask] = float('-inf')
                 logits = torch.gather(sorted_logits, 1, sorted_indices.argsort(-1))
+
+            if min_p > 0:
+                probs = F.softmax(logits, dim=-1)
+                threshold = probs.max(dim=-1, keepdim=True)[0] * min_p
+                logits[probs < threshold] = float('-inf')
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             gen_ids = torch.cat([gen_ids, next_token], dim=1)
 
-            if (next_token == eos_token_id).any():
-                break
+            done |= (next_token.squeeze(-1) == eos_token_id)
 
         return gen_ids
 

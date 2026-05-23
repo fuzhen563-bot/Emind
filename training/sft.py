@@ -58,7 +58,7 @@ class SFTTrainer(TrainerBase):
         if loss_mask is not None:
             loss_mask = loss_mask.to(self.device)
 
-        _, logits, _ = self.model(input_ids)
+        _, logits, _, _, aux_loss, _ = self.model(input_ids)
         vocab_size = logits.shape[-1]
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
@@ -73,6 +73,10 @@ class SFTTrainer(TrainerBase):
         if loss_mask is not None:
             shift_mask = loss_mask[..., 1:].contiguous().view(-1)
             loss = loss * shift_mask
-            return loss.sum() / (shift_mask.sum() + 1e-8)
+            loss = loss.sum() / (shift_mask.sum() + 1e-8)
+        else:
+            loss = loss.mean()
 
-        return loss.mean()
+        loss = loss + aux_loss
+
+        return loss

@@ -22,6 +22,8 @@ class TrainingConfig:
     weight_decay: float = 0.1
     warmup_steps: int = 200
     lr_scheduler: str = "cosine"
+    optimizer: str = "adamw"
+    use_fused_adam: bool = True
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_epsilon: float = 1e-8
@@ -29,8 +31,13 @@ class TrainingConfig:
 
     use_fp16: bool = False
     use_bf16: bool = True
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
     use_fsdp: bool = False
     fsdp_full_shard: bool = True
+    neftune_noise_alpha: float = 0.0
+    curriculum_stages: int = 1
+    replay_ratio: float = 0.0
     activation_checkpointing: bool = True
 
     save_steps: int = 500
