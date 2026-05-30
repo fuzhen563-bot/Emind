@@ -26,7 +26,6 @@ Emind 是一个从零构建的生产级大语言模型框架，覆盖 **模型�
 - **评测套件** — MMLU、C-Eval、HumanEval（沙箱安全执行）一键运行
 - **WebUI** — FastAPI + SSE 流式、深/亮主题、思考过程可视化、模型竞技场、多模式切换
 - **OpenAI 兼容 API** — `/v1/chat/completions`、`/v1/completions`、`/v1/models`，支持 Function Calling
-- **代码质量** — 全链路 3 轮代码检修，修复 15+ 运行时 Bug（FSDP 未定义、generate RoPE 越界、同步生成器阻塞事件循环、**kwargs 静默丢弃等）
 - **Docker 部署** — 多阶段构建 + docker-compose（api / vllm / jupyter 多 profile）
 
 ## 项目结构
