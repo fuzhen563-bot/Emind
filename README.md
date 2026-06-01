@@ -10,8 +10,7 @@
   </p>
   <p>
     <strong>开发者：</strong>
-    <a href="https://yiziyun.com">亦梓科技</a> &
-    <a href="https://yyzjai.cn">亦智大模型研究院</a>
+    <a href="#">亦智大模型研究院</a>
   </p>
   <p>
     <a href="https://yiziyun.com">厦门亦梓科技有限公司</a> ·
