@@ -203,7 +203,6 @@ python cli.py serve --port 3333
 | 📦 **包管理** | `zhengliu` 包纳入 setup.py/pyproject.toml，`zl` CLI 入口 | — |
 | ⚡ **稳定性** | 全模块 py_compile 检查通过，41 个已识别 Bug 中修复 37 个 | 37 个 |
 
-> 详细变更见 [`BUG_TRACKER.md`](BUG_TRACKER.md) 和 [`TRAINING_GUIDE.md`](TRAINING_GUIDE.md)
 
 ---
 
