@@ -1,3 +1,0 @@
-requests>=2.28
-# 可选：使用 unified_inference 后端的完整体验
-# pip install -e ..  # Emind 项目根目录
