@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="/logo.png" alt="Emind AI Logo" width="120">
+  <img src="logo.png" alt="Emind AI Logo" width="120">
   <h1>Emind AI</h1>
   <h3>亦梓·智脑 — 让每个行业拥有自己的大模型</h3>
   <p>
