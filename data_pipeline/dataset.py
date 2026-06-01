@@ -142,7 +142,9 @@ class DatasetManager:
         for item in items:
             text = json.dumps(item, ensure_ascii=False)
             total_chars += len(text)
-            total_tokens_est += len(text) // 2
+            zh_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+            en_count = len(text) - zh_count
+            total_tokens_est += int(zh_count * 1.5 + en_count * 0.25) + 1
         return {
             "file": path,
             "samples": len(items),

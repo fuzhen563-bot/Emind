@@ -1,4 +1,3 @@
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -125,7 +124,8 @@ class GroupedQueryAttention(nn.Module):
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        skip_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_len, _ = x.shape
 
         q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k)
@@ -148,6 +148,8 @@ class GroupedQueryAttention(nn.Module):
         if self.use_kv_quant and not self.training:
             k_q, v_q, k_s, v_s = self.quantize_kv(k, v)
             new_kv_cache = (k_q, v_q, k_s, v_s)
+        elif skip_cache:
+            new_kv_cache = None
         else:
             new_kv_cache = (k.detach(), v.detach())
 
@@ -208,9 +210,13 @@ class MoEFFN(nn.Module):
         for i in range(self.n_experts):
             mask = (top_k_indices == i).any(dim=-1)
             if mask.any():
-                expert_out = self.experts[i](x_flat[mask])
-                weights = top_k_probs[top_k_indices == i].to(expert_out.dtype).unsqueeze(-1)
-                out[mask] += expert_out * weights
+                selected_indices = mask.nonzero(as_tuple=True)[0]
+                expert_out = self.experts[i](x_flat[selected_indices])
+                token_weights = top_k_probs[top_k_indices == i]
+                if token_weights.numel() > expert_out.size(0):
+                    token_weights = token_weights[:expert_out.size(0)]
+                weights = token_weights.to(expert_out.dtype).unsqueeze(-1)
+                out[selected_indices] += expert_out * weights
 
         # Load balancing auxiliary loss
         tokens_per_expert = torch.zeros(self.n_experts, device=x.device)
@@ -249,10 +255,10 @@ class TransformerBlock(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, cos, sin, mask=None, kv_cache=None):
+    def forward(self, x, cos, sin, mask=None, kv_cache=None, skip_cache=False):
         if self.parallel:
             h = self.ln1(x)
-            attn_out, new_cache = self.attention(h, cos, sin, mask, kv_cache)
+            attn_out, new_cache = self.attention(h, cos, sin, mask, kv_cache, skip_cache=skip_cache)
             if self.use_moe:
                 ff_out, aux_loss = self.feed_forward(h)
             else:
@@ -260,7 +266,7 @@ class TransformerBlock(nn.Module):
                 aux_loss = torch.tensor(0.0, device=x.device)
             x = x + self.dropout1(attn_out) + self.dropout2(ff_out)
         else:
-            attn_out, new_cache = self.attention(self.ln1(x), cos, sin, mask, kv_cache)
+            attn_out, new_cache = self.attention(self.ln1(x), cos, sin, mask, kv_cache, skip_cache=skip_cache)
             x = x + self.dropout1(attn_out)
             h = self.ln2(x)
             if self.use_moe:
@@ -308,10 +314,31 @@ class EmindConfig:
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, f"d_model({self.d_model}) must be divisible by n_heads({self.n_heads})"
         assert self.n_heads % self.n_kv_heads == 0, f"n_heads({self.n_heads}) must be divisible by n_kv_heads({self.n_kv_heads})"
+        # BUG-022 fix: complete validation
+        assert self.d_model > 0, f"d_model must be positive, got {self.d_model}"
+        assert self.n_layers > 0, f"n_layers must be positive, got {self.n_layers}"
+        assert self.vocab_size > 0, f"vocab_size must be positive, got {self.vocab_size}"
+        assert self.max_seq_len > 0, f"max_seq_len must be positive, got {self.max_seq_len}"
+        assert self.d_ff > 0, f"d_ff must be positive, got {self.d_ff}"
+        if self.use_moe:
+            assert self.n_experts > 0, f"n_experts must be positive, got {self.n_experts}"
+            assert self.n_active_experts > 0 and self.n_active_experts <= self.n_experts, \
+                f"n_active_experts must be in [1, {self.n_experts}], got {self.n_active_experts}"
+            assert self.moe_aux_loss_coef >= 0, f"moe_aux_loss_coef must be >= 0, got {self.moe_aux_loss_coef}"
+        if self.rope_scaling_type is not None:
+            assert self.rope_scaling_type in ("ntk", "linear", "yarn"), \
+                f"rope_scaling_type must be 'ntk', 'linear', or 'yarn', got '{self.rope_scaling_type}'"
+            assert self.rope_scaling_factor > 0, f"rope_scaling_factor must be > 0, got {self.rope_scaling_factor}"
 
     @classmethod
     def from_dict(cls, d: dict) -> "EmindConfig":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        # BUG-021 fix: warn about unknown keys instead of silently ignoring
+        known = cls.__dataclass_fields__
+        unknown = {k: v for k, v in d.items() if k not in known}
+        if unknown:
+            import warnings
+            warnings.warn(f"EmindConfig.from_dict: ignoring unknown keys: {list(unknown.keys())}", stacklevel=2)
+        return cls(**{k: v for k, v in d.items() if k in known})
 
     def to_dict(self) -> dict:
         return {f.name: getattr(self, f.name) for f in self.__dataclass_fields__.values()}
@@ -359,6 +386,7 @@ class EmindLM(nn.Module):
 
         self._init_weights()
         self.lm_head.weight = self.token_embedding.weight
+        self.neftune_alpha = 0.0
 
     def _init_weights(self):
         for m in self.modules():
@@ -384,9 +412,16 @@ class EmindLM(nn.Module):
         device = input_ids.device
 
         x = self.token_embedding(input_ids)
+        if self.training and self.neftune_alpha > 0:
+            eps = self.neftune_alpha / (self.config.d_model ** 0.5)
+            x = x + torch.randn_like(x) * eps
         cos, sin = self.rope_cos.to(device), self.rope_sin.to(device)
-        mask = self.create_causal_mask(seq_len, device)
+        # Training: mask=None → is_causal=True → Flash Attention enabled (2-4x faster)
+        # Inference: explicit mask for correct attention pattern with KV cache
+        mask = None if self.training else self.create_causal_mask(seq_len, device)
 
+        # BUG-020 fix: skip KV cache creation during training (saves memory + compute)
+        skip_cache = self.training and kv_caches is None
         hidden_states = [] if output_hidden_states else None
         new_caches = []
         use_ckpt = self.training and self.config.activation_checkpointing
@@ -398,7 +433,7 @@ class EmindLM(nn.Module):
                     layer, x, cos, sin, mask, None, use_reentrant=False
                 )
             else:
-                x, new_cache, aux_loss = layer(x, cos, sin, mask, cache)
+                x, new_cache, aux_loss = layer(x, cos, sin, mask, cache, skip_cache=skip_cache)
             new_caches.append(new_cache)
             aux_loss_total = aux_loss_total + aux_loss
             if output_hidden_states:
@@ -412,15 +447,6 @@ class EmindLM(nn.Module):
             loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1), ignore_index=self.config.pad_token_id)
 
         return loss, logits, new_caches, hidden_states if output_hidden_states else None, aux_loss_total, x
-
-    def apply_neftune_noise(self, noise_alpha: float = 5.0):
-        if not self.training:
-            return
-        eps = noise_alpha / (self.config.d_model ** 0.5)
-        with torch.no_grad():
-            embed = self.token_embedding
-            noise = torch.randn_like(embed.weight) * eps
-            embed.weight.add_(noise)
 
     @torch.no_grad()
     def generate_beam(
@@ -513,6 +539,14 @@ class EmindLM(nn.Module):
         device = input_ids.device
         batch_size = input_ids.shape[0]
 
+        if batch_size > 1:
+            results = []
+            for i in range(batch_size):
+                results.append(self.generate_speculative(
+                    input_ids[i:i+1], max_new_tokens, temperature,
+                    draft_layers, gamma, eos_token_id))
+            return torch.cat(results, dim=0)
+
         def _clone_cache(cache):
             if cache is None:
                 return None
@@ -585,7 +619,7 @@ class EmindLM(nn.Module):
                 verify_caches[i] = vc
 
             full_logits = self.lm_head(self.ln_f(x_verify))
-            full_probs = F.softmax(full_logits[:, :new_token.shape[1]:, :] / temperature, dim=-1)
+            full_probs = F.softmax(full_logits[:, :new_token.shape[1]] / temperature, dim=-1)
             draft_probs_base = F.softmax(draft_logits, dim=-1)
 
             # 逐 token 接受/拒绝
@@ -714,6 +748,7 @@ class EmindLM(nn.Module):
                                 logits[b, tid] /= repetition_penalty
 
             logits = logits / temperature
+            logits = logits.clone()
 
             if top_k is not None and top_k > 0:
                 v = torch.topk(logits, min(top_k, logits.size(-1)))[0][:, -1:]
@@ -759,7 +794,7 @@ if __name__ == "__main__":
     print(f"Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     ids = torch.randint(0, cfg.vocab_size, (2, 64))
-    loss, logits, _ = model(ids, labels=ids)
+    loss, logits, _, _, _, _ = model(ids, labels=ids)
     print(f"Loss: {loss.item():.4f}, Logits: {logits.shape}")
 
     out = model.generate(torch.tensor([[1, 100, 200, 300]]), max_new_tokens=20)

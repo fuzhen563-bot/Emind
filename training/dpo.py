@@ -9,6 +9,15 @@ from training.config import TrainingConfig
 from training.trainer import TrainerBase
 
 
+def _offload_model_to_cpu(model: EmindLM) -> EmindLM:
+    """BUG-012 fix: Move ref model to CPU to halve GPU memory usage for DPO."""
+    model.cpu()
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
 class DPODataset(Dataset):
     def __init__(self, data: List[Dict[str, Any]], tokenizer, max_seq_len: int = 2048, pad_token_id: int = 0):
         self.data = data
@@ -52,12 +61,10 @@ class DPOTrainer(TrainerBase):
         label_smoothing: float = 0.0,
     ):
         super().__init__(model, config, train_dataset, eval_dataset)
+        # BUG-012 fix: offload ref model to CPU to halve GPU memory
         self.ref_model = ref_model
         if self.ref_model is not None:
-            self.ref_model.to(self.device)
-            self.ref_model.eval()
-            for p in self.ref_model.parameters():
-                p.requires_grad = False
+            _offload_model_to_cpu(self.ref_model)
         self.beta = beta
         self.label_smoothing = label_smoothing
 
@@ -93,8 +100,11 @@ class DPOTrainer(TrainerBase):
 
         if self.ref_model is not None:
             with torch.no_grad():
-                _, ref_chosen_logits, _, _, _, _ = self.ref_model(chosen_ids)
-                _, ref_rejected_logits, _, _, _, _ = self.ref_model(rejected_ids)
+                # BUG-012 fix: ref model on CPU, move inputs to CPU for inference
+                _, ref_chosen_logits, _, _, _, _ = self.ref_model(chosen_ids.cpu())
+                _, ref_rejected_logits, _, _, _, _ = self.ref_model(rejected_ids.cpu())
+                ref_chosen_logits = ref_chosen_logits.to(self.device)
+                ref_rejected_logits = ref_rejected_logits.to(self.device)
                 ref_chosen_logps = self._response_log_probs(ref_chosen_logits, chosen_ids, prompt_lens, pad_id)
                 ref_rejected_logps = self._response_log_probs(ref_rejected_logits, rejected_ids, prompt_lens, pad_id)
         else:

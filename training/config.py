@@ -14,7 +14,7 @@ class TrainingConfig:
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
     max_seq_len: int = 2048
-    dataloader_num_workers: int = 0
+    dataloader_num_workers: int = 4
     pin_memory: bool = True
 
     learning_rate: float = 2e-5
@@ -38,7 +38,11 @@ class TrainingConfig:
     neftune_noise_alpha: float = 0.0
     curriculum_stages: int = 1
     replay_ratio: float = 0.0
-    activation_checkpointing: bool = True
+    activation_checkpointing: bool = False
+    # BUG-011 fix: WandB/TensorBoard integration
+    log_backend: str = "json"  # "json", "wandb", "tensorboard"
+    wandb_project: str = "emind"
+    wandb_entity: str = "emind_exp"
 
     save_steps: int = 500
     save_total_limit: int = 3
@@ -46,6 +50,11 @@ class TrainingConfig:
     eval_batch_size: Optional[int] = None
     logging_steps: int = 10
     early_stop_patience: int = 5
+
+    # BUG-011 fix: external logging backend support
+    log_backend: str = "json"  # "json", "wandb", "tensorboard"
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
 
     resume_from: Optional[str] = None
 

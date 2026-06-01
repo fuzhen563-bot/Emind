@@ -881,12 +881,12 @@ class VLLMIntegratedEngine:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if role == "system":
-                parts.append(f"系统: {content}")
+                parts.append(f"<|im_start|>system\n{content}<|im_end|>")
             elif role == "user":
-                parts.append(f"用户: {content}")
+                parts.append(f"<|im_start|>user\n{content}<|im_end|>")
             elif role == "assistant":
-                parts.append(f"助手: {content}")
-        parts.append("助手:")
+                parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
         return "\n".join(parts)
 
     # ================================================================

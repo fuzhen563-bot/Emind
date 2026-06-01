@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 
 class DataFormatter:
     def __init__(self, system_prompt: Optional[str] = None):
-        self.system_prompt = system_prompt or "你是一个有用的人工智能助手。"
+        self.system_prompt = system_prompt or "你是Emind·智脑，由亦梓科技开发。"
 
     def to_sft(self, items: List[Dict], prompt_key: str = "prompt",
                response_key: str = "response", use_system: bool = True) -> List[Dict]:
@@ -27,6 +27,19 @@ class DataFormatter:
             messages.append({"role": "assistant", "content": response})
             results.append({"messages": messages})
         print(f"Formatted {len(results)} SFT samples")
+        return results
+
+    def to_sft_flat(self, items: List[Dict], prompt_key: str = "prompt",
+                    response_key: str = "response") -> List[Dict]:
+        """Output prompt/response format expected by SFTDataset"""
+        results = []
+        for item in items:
+            prompt = item.get(prompt_key, item.get("instruction", item.get("text", "")))
+            response = item.get(response_key, item.get("output", item.get("answer", "")))
+            if not prompt or not response:
+                continue
+            results.append({"prompt": prompt, "response": response})
+        print(f"Formatted {len(results)} SFT flat samples")
         return results
 
     def to_dpo(self, items: List[Dict], prompt_key: str = "prompt",

@@ -9,7 +9,6 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional, List, Dict, Any, Callable, Union, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
-
 from model import EmindLM
 from training.config import TrainingConfig
 from training.trainer import TrainerBase
@@ -30,6 +29,7 @@ class PPOConfig(TrainingConfig):
     ppo_epochs: int = 4
     mini_batch_size: int = 4
     gamma: float = 0.99
+    gae_lambda: float = 0.95
     use_kl_estimator: str = "kl3"
 
 
@@ -338,6 +338,28 @@ class PPOTrainer(TrainerBase):
         total = pg_loss + kl_loss + v_loss
         return total, pg_loss, kl_loss, v_loss
 
+    def _compute_gae(
+        self,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        gamma = self.config.gamma
+        lam = self.config.gae_lambda
+        seq_len = values.size(1)
+        advantages = torch.zeros_like(values)
+        last_gae = 0.0
+        for t in reversed(range(seq_len)):
+            if t == seq_len - 1:
+                next_val = torch.zeros_like(values[:, -1])
+            else:
+                next_val = values[:, t + 1]
+            delta = rewards + gamma * next_val * mask[:, t + 1] - values[:, t]
+            last_gae = delta + gamma * lam * mask[:, t] * last_gae
+            advantages[:, t] = last_gae
+        returns = advantages + values
+        return advantages, returns
+
     def train(self, resume: bool = False):
         loader = DataLoader(self.train_dataset, batch_size=self.config.batch_size, shuffle=True)
 
@@ -358,9 +380,10 @@ class PPOTrainer(TrainerBase):
                 ref_logps = rollout["ref_logps"].detach() if rollout["ref_logps"] is not None else None
                 old_val = rollout["values"].detach()
 
-                advantages = rollout["rewards"] - old_val
+                mask = self._response_mask(seq.size(1), plen, bs)
+                rewards = rollout["rewards"].unsqueeze(-1).expand_as(old_val) * mask
+                advantages, returns = self._compute_gae(rewards, old_val, mask)
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                returns = rollout["rewards"]
 
                 mask = self._response_mask(seq.size(1), plen, bs)
 
@@ -405,7 +428,7 @@ class PPOTrainer(TrainerBase):
 # GRPOTrainer (DeepSeekMath GRPO – no critic)
 # =============================================================================
 
-class GRPOTrainer:
+class GRPOTrainer(TrainerBase):
     """
     GRPO: 每组 group_size 个回复, 组内 reward 归一化做 advantage, 策略梯度 + KL.
     """
@@ -419,14 +442,8 @@ class GRPOTrainer:
         reward_fn: Optional[Callable] = None,
         tokenizer=None,
     ):
-        self.model = model
-        self.config = config
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
+        super().__init__(model, config, train_dataset, eval_dataset)
         self.tokenizer = tokenizer
-
-        self.device = torch.device(config.device)
-        self.model.to(self.device)
 
         self.ref_model = ref_model
         if self.ref_model is not None:
@@ -436,7 +453,6 @@ class GRPOTrainer:
                 p.requires_grad = False
 
         self.reward_fn = reward_fn
-
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
@@ -445,9 +461,6 @@ class GRPOTrainer:
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config.epochs * max(len(train_dataset), 1),
         )
-        self.checkpoint = CheckpointManager(config.output_dir, config.save_total_limit, config.experiment_name)
-        self.metrics = MetricsTracker()
-        self.global_step = 0
 
     @torch.no_grad()
     def _generate_group(self, prompts: torch.Tensor) -> Dict:

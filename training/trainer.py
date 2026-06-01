@@ -2,6 +2,7 @@ import os
 import math
 import time
 import torch
+from contextlib import nullcontext
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -41,28 +42,37 @@ class TrainerBase:
         self.model.to(self.device)
         if config.activation_checkpointing:
             self.model.config.activation_checkpointing = True
-        if config.compile_model and hasattr(torch, 'compile'):
-            self.model = torch.compile(self.model, mode=config.compile_mode)
         if config.use_fsdp:
             self._wrap_fsdp()
+        if config.compile_model and hasattr(torch, 'compile') and not config.use_fsdp:
+            self.model = torch.compile(self.model, mode=config.compile_mode)
+        self.model.neftune_alpha = config.neftune_noise_alpha
 
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
         self.checkpoint = CheckpointManager(config.output_dir, config.save_total_limit, config.experiment_name)
-        self.metrics = MetricsTracker()
+        # BUG-011 fix: pass logging backend config to MetricsTracker
+        self.metrics = MetricsTracker(
+            backend=config.log_backend,
+            wandb_project=config.wandb_project,
+            wandb_entity=config.wandb_entity,
+            experiment_name=config.experiment_name,
+        )
         self.global_step = 0
         self.epoch = 0
 
-        self.scaler = torch.cuda.amp.GradScaler() if config.use_fp16 and self.device.type == "cuda" else None
+        use_grad_scaler = config.use_fp16 and self.device.type == "cuda" and not config.use_fsdp
+        self.scaler = torch.cuda.amp.GradScaler() if use_grad_scaler else None
 
     def _wrap_fsdp(self):
         try:
+            from functools import partial
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
             from torch.distributed.fsdp.api import MixedPrecision
             from model import TransformerBlock
 
-            wrap_policy = transformer_auto_wrap_policy(transformer_layer_cls={TransformerBlock})
+            wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={TransformerBlock})
 
             mp_policy = None
             if self.config.use_bf16:
@@ -98,7 +108,11 @@ class TrainerBase:
         )
 
     def _create_scheduler(self) -> LambdaLR:
-        effective_steps = len(self.train_dataset) // (self.config.batch_size * self.world_size * max(1, self.config.gradient_accumulation_steps))
+        if hasattr(self.train_dataset, '_data'):
+            total_samples = len(self.train_dataset._data)
+        else:
+            total_samples = len(self.train_dataset)
+        effective_steps = total_samples // (self.config.batch_size * self.world_size * max(1, self.config.gradient_accumulation_steps))
         total_steps = max(1, effective_steps * self.config.epochs)
 
         def lr_lambda(step: int) -> float:
@@ -148,9 +162,12 @@ class TrainerBase:
         raise NotImplementedError
 
     def training_step(self, batch: Any) -> torch.Tensor:
-        if self.config.neftune_noise_alpha > 0:
-            self.model.apply_neftune_noise(self.config.neftune_noise_alpha)
-        loss = self.compute_loss(batch)
+        # BUG-007 fix: BF16 autocast for non-FSDP mode
+        if self.config.use_bf16 and not self.config.use_fsdp and self.device.type == "cuda":
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = self.compute_loss(batch)
+        else:
+            loss = self.compute_loss(batch)
         if self.config.gradient_accumulation_steps > 1:
             loss = loss / self.config.gradient_accumulation_steps
         if self.scaler:
@@ -163,7 +180,11 @@ class TrainerBase:
         if self.scaler:
             self.scaler.unscale_(self.optimizer)
         if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            # BUG-010 fix: FSDP requires model.clip_grad_norm_() instead of torch.nn.utils
+            if self.config.use_fsdp and hasattr(self.model, 'clip_grad_norm_'):
+                self.model.clip_grad_norm_(self.config.max_grad_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
         if self.scaler:
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -179,11 +200,22 @@ class TrainerBase:
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
-        with torch.no_grad():
+        # BUG-007 fix: BF16 autocast for non-FSDP eval
+        ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) \
+            if self.config.use_bf16 and not self.config.use_fsdp and self.device.type == "cuda" \
+            else nullcontext()
+        with torch.no_grad(), ctx:
             for batch in loader:
                 loss = self.compute_loss(batch)
                 total_loss += loss.item()
                 num_batches += 1
+        # BUG-014 fix: aggregate eval loss across distributed ranks
+        if self.config.use_fsdp and self.world_size > 1:
+            import torch.distributed as dist
+            loss_tensor = torch.tensor([total_loss, num_batches], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            total_loss = loss_tensor[0].item()
+            num_batches = int(loss_tensor[1].item())
         self.model.train()
         avg_loss = total_loss / max(1, num_batches)
         return {"eval_loss": avg_loss, "perplexity": math.exp(avg_loss) if avg_loss > 0 else float('inf')}
@@ -209,6 +241,13 @@ class TrainerBase:
                 train_loader.sampler.set_epoch(epoch)
 
             for batch_idx, batch in enumerate(train_loader):
+                # BUG-004 fix: NEFTune noise only on first gradient accumulation step
+                if self.config.neftune_noise_alpha > 0:
+                    if batch_idx % self.config.gradient_accumulation_steps == 0:
+                        self.model.neftune_alpha = self.config.neftune_noise_alpha
+                    else:
+                        self.model.neftune_alpha = 0.0
+
                 step_loss = self.training_step(batch)
 
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
@@ -260,15 +299,23 @@ class TrainerBase:
             print(f"Training complete. {self.metrics.summary()}")
 
     def _save(self, is_best: bool = False):
-        model_state = self.model.state_dict()
+        model_state = None
+        optimizer_state = None
         if self.config.use_fsdp:
+            # BUG-013 fix: proper FSDP checkpoint saving with full state dict
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType
-            cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
-            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=cfg):
+            from torch.distributed.fsdp.api import FullStateDictConfig, StateDictType, FullOptimStateDictConfig
+            # Save full model state dict (rank0_only, offload to CPU to save GPU memory)
+            model_cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
+            optim_cfg = FullOptimStateDictConfig(rank0_only=True, offload_to_cpu=True)
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, model_cfg, optim_cfg):
                 model_state = self.model.state_dict()
+                optimizer_state = self.optimizer.state_dict()
             if self.rank != 0:
                 return
+        else:
+            model_state = self.model.state_dict()
+            optimizer_state = self.optimizer.state_dict()
 
         import dataclasses
         model_cfg = dataclasses.asdict(self.model.config) if hasattr(self.model, 'config') else {}
@@ -276,7 +323,7 @@ class TrainerBase:
             step=self.global_step,
             model_state=model_state,
             model_config=model_cfg,
-            optimizer_state=self.optimizer.state_dict(),
+            optimizer_state=optimizer_state,
             scheduler_state=self.scheduler.state_dict(),
             metrics={"train_loss": self.metrics.current_epoch.get("train_loss", 0)},
             is_best=is_best,

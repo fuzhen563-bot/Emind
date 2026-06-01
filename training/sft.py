@@ -18,7 +18,24 @@ class SFTDataset(Dataset):
                 encoded = tokenizer.encode(item)
                 input_ids = encoded[:max_seq_len]
                 labels = input_ids.copy()
-                loss_mask = [1] * len(input_ids)
+                prompt_len = 0
+                loss_mask = [0] * len(input_ids)
+            elif "messages" in item:
+                prompt = ""
+                response = ""
+                for msg in item["messages"]:
+                    if msg["role"] == "user":
+                        prompt += msg.get("content", "")
+                    elif msg["role"] == "assistant":
+                        response += msg.get("content", "")
+                full_text = prompt + response
+                encoded = tokenizer.encode(full_text)
+                input_ids = encoded[:max_seq_len]
+                labels = input_ids.copy()
+                prompt_len = len(tokenizer.encode(prompt))
+                if prompt_len > len(input_ids):
+                    prompt_len = len(input_ids)
+                loss_mask = [0] * prompt_len + [1] * (len(input_ids) - prompt_len)
             else:
                 prompt = item.get("prompt", "")
                 response = item.get("response", "")
@@ -27,9 +44,9 @@ class SFTDataset(Dataset):
                 input_ids = encoded[:max_seq_len]
                 labels = input_ids.copy()
                 prompt_len = len(tokenizer.encode(prompt))
+                if prompt_len > len(input_ids):
+                    prompt_len = len(input_ids)
                 loss_mask = [0] * prompt_len + [1] * (len(input_ids) - prompt_len)
-                if len(loss_mask) < max_seq_len:
-                    loss_mask = loss_mask + [0] * (max_seq_len - len(loss_mask))
 
             pad_len = max_seq_len - len(input_ids)
             if pad_len > 0:
@@ -63,19 +80,23 @@ class SFTTrainer(TrainerBase):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
-        loss = F.cross_entropy(
-            shift_logits.view(-1, vocab_size),
-            shift_labels.view(-1),
-            ignore_index=-100,
-            reduction="none",
-        )
-
+        # BUG-017 fix: only compute CE on assistant token positions
+        # instead of computing on all tokens then zeroing out prompt positions
         if loss_mask is not None:
             shift_mask = loss_mask[..., 1:].contiguous().view(-1)
-            loss = loss * shift_mask
-            loss = loss.sum() / (shift_mask.sum() + 1e-8)
+            active_indices = shift_mask.nonzero(as_tuple=True)[0]
+            if active_indices.numel() > 0:
+                active_logits = shift_logits.view(-1, vocab_size)[active_indices]
+                active_labels = shift_labels.view(-1)[active_indices]
+                loss = F.cross_entropy(active_logits, active_labels, reduction="mean")
+            else:
+                loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         else:
-            loss = loss.mean()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
 
         loss = loss + aux_loss
 

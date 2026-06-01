@@ -66,13 +66,16 @@ class DataCollector:
         conversations = []
         for item in data:
             messages = item.get("messages", item.get("conversations", []))
-            if messages:
-                for i in range(0, len(messages) - 1, 2):
-                    if i + 1 < len(messages):
-                        conversations.append({
-                            "prompt": messages[i].get("content", messages[i].get("value", "")),
-                            "response": messages[i + 1].get("content", messages[i + 1].get("value", "")),
-                        })
+            i = 0
+            while i < len(messages) - 1:
+                if messages[i].get("role") == "user" and messages[i + 1].get("role") == "assistant":
+                    conversations.append({
+                        "prompt": messages[i].get("content", messages[i].get("value", "")),
+                        "response": messages[i + 1].get("content", messages[i + 1].get("value", "")),
+                    })
+                    i += 2
+                else:
+                    i += 1
         print(f"Extracted {len(conversations)} prompt-response pairs")
         return conversations
 

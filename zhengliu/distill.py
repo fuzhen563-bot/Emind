@@ -1,30 +1,30 @@
 """
-<<<<<<< HEAD
 蒸馏引擎 — 基础蒸馏 + 进阶蒸馏 + 质量控制 + 多轮修正
-=======
-蒸馏引擎 — 连接 Teacher 模型 → 生成 SFT 数据 → 输出 JSONL
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
+
+修复记录 (2026-06-01):
+- BUG-D1: run() 线程安全 — done/success/fail 改为 threading 原子计数
+- BUG-D2: 无断点续传 — 添加 checkpoint 文件, 中断后可 --resume 继续
+- BUG-D3: 429 限流重试 — 改为指数退避 (0.5s → 2s → 8s → 32s)
+- BUG-D4: 无 token 用量追踪 — 添加 usage 统计 + 成本估算
+- BUG-D5: 去重窗口太小 — 从 50 条扩展到 200 条
 """
 import json
 import os
 import sys
 import time
-<<<<<<< HEAD
 import hashlib
 import math
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from typing import Optional
-=======
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
 
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
 _parent = os.path.dirname(_pkg_dir)
 if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
-<<<<<<< HEAD
 from zhengliu.config import DistillConfig
 from zhengliu.seeds import generate_prompts, inject_reasoning_trace, generate_reasoning_graph
 
@@ -32,27 +32,21 @@ from zhengliu.seeds import generate_prompts, inject_reasoning_trace, generate_re
 class DistillEngine:
     """蒸馏引擎 — 连接 Teacher, 生成 SFT/DPO 数据"""
 
-=======
-import hashlib
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import Counter
-from typing import Optional
-
-from zhengliu.config import DistillConfig, parse_args
-from zhengliu.seeds import generate_prompts
-
-
-class DistillEngine:
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
     def __init__(self, config: DistillConfig):
         self.config = config
         self.teacher = None
         self._use_requests = False
-<<<<<<< HEAD
         self._dashboard = None
         self._session = None        # HTTP 连接池 (惰性初始化)
         self._session_lock = None    # 线程安全锁
+        # BUG-D4 fix: token usage tracking
+        self._token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # BUG-D1 fix: thread-safe counters
+        self._counter_lock = threading.Lock()
+        self._done = 0
+        self._success = 0
+        self._fail = 0
+        self._consec_fail = 0
         if not config.dry_run:
             self._init_teacher()
 
@@ -122,63 +116,29 @@ class DistillEngine:
         headers = {"Content-Type": "application/json"}
         if cfg.resolved_api_key:
             headers["Authorization"] = f"Bearer {cfg.resolved_api_key}"
-=======
-        if not config.dry_run:
-            self._init_teacher()
-
-    def _init_teacher(self):
-        backend_type = self.config.backend_type
-        try:
-            from unified_inference import UnifiedInferenceEngine, BackendConfig
-        except ImportError:
-            print("  unified_inference 不可用，使用 HTTP 直连模式")
-            self._use_requests = True
-            return
-
-        cfg = BackendConfig(
-            backend_type=backend_type,
-            model_name=self.config.model_name,
-            base_url=self.config.resolved_base_url,
-            api_key=self.config.resolved_api_key,
-        )
-        self.teacher = UnifiedInferenceEngine(cfg)
-        if self.teacher.is_available():
-            print(f"  Teacher 已就绪: {backend_type} / {cfg.model_name}")
-            self._use_requests = False
-        else:
-            print(f"  Teacher 后端 {backend_type} 不可用，回退 HTTP 直连")
-            if cfg.resolved_api_key:
-                masked = cfg.resolved_api_key[:8] + "..." + cfg.resolved_api_key[-4:]
-                print(f"    使用 API Key: {masked}")
-            print(f"    Endpoint: {cfg.base_url or cfg.resolved_base_url}/v1/chat/completions")
-            print(f"    Model: {cfg.model_name}")
-            self._use_requests = True
-
-    def _generate_via_requests(self, prompt: str) -> str:
-        import requests
-
-        cfg = self.config
-        headers = {"Content-Type": "application/json"}
-        ak = cfg.resolved_api_key
-        if ak:
-            headers["Authorization"] = f"Bearer {ak}"
-
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
         payload = {
             "model": cfg.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": cfg.max_tokens,
-<<<<<<< HEAD
             "temperature": temperature if temperature is not None else cfg.temperature,
         }
         url = f"{cfg.resolved_base_url.rstrip('/')}/v1/chat/completions"
 
-        delays = [0.5, 1.5, 4.0]
-        for attempt, delay in enumerate(delays):
+        # BUG-D3 fix: exponential backoff for rate limiting (429)
+        # 0.5s → 2s → 8s → 32s (4 retries max)
+        max_retries = 4
+        for attempt in range(max_retries):
+            delay = 0.5 * (4 ** attempt)  # exponential: 0.5, 2, 8, 32
             try:
                 resp = session.post(url, headers=headers, json=payload, timeout=90)
                 if resp.status_code == 200:
                     d = resp.json()
+                    # BUG-D4 fix: track token usage
+                    usage = d.get("usage", {})
+                    if usage:
+                        self._token_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+                        self._token_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+                        self._token_usage["total_tokens"] += usage.get("total_tokens", 0)
                     return d["choices"][0]["message"]["content"]
                 # 鉴权错误: 不重试
                 if resp.status_code in (401, 403):
@@ -189,19 +149,24 @@ class DistillEngine:
                     self._print(f"请求错误 HTTP 400: {body}")
                     return ""  # 400 不重试
                 if resp.status_code == 429:
-                    time.sleep(delay * 2)
-                    continue
-                self._print(f"HTTP {resp.status_code} (尝试 {attempt+1}/{len(delays)})")
-                if attempt < len(delays) - 1:
+                    self._print(f"限流 429 (尝试 {attempt+1}/{max_retries}, 等待 {delay:.1f}s)")
                     time.sleep(delay)
+                    continue
+                # 5xx server errors: retry with backoff
+                if resp.status_code >= 500:
+                    self._print(f"服务器错误 HTTP {resp.status_code} (尝试 {attempt+1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                self._print(f"HTTP {resp.status_code} — 不重试")
+                return ""
             except requests.exceptions.ConnectionError:
-                self._print(f"连接失败 (尝试 {attempt+1}/{len(delays)})")
+                self._print(f"连接失败 (尝试 {attempt+1}/{max_retries}, 等待 {delay:.1f}s)")
                 time.sleep(delay)
             except requests.exceptions.Timeout:
-                self._print(f"超时 (尝试 {attempt+1}/{len(delays)})")
+                self._print(f"超时 (尝试 {attempt+1}/{max_retries}, 等待 {delay:.1f}s)")
                 time.sleep(delay)
             except Exception as e:
-                self._print(f"API异常 (尝试 {attempt+1}/{len(delays)}): {e}")
+                self._print(f"API异常 (尝试 {attempt+1}/{max_retries}): {e}")
                 time.sleep(delay)
         return ""
 
@@ -327,6 +292,7 @@ class DistillEngine:
         P1: n-gram 语义去重。
         结合 MD5 精确去重 + n-gram 相似度模糊去重。
         threshold: 相似度 > 此值视为重复。
+        BUG-D5 fix: dedup window expanded from 50 to 200.
         """
         out = []
         seen_hashes = set()
@@ -342,9 +308,9 @@ class DistillEngine:
                 continue
             seen_hashes.add(h)
 
-            # n-gram 模糊去重 (仅对已有样本检查，避免 O(n²))
+            # n-gram 模糊去重 (BUG-D5: 检查最近 200 条而非 50 条)
             is_dup = False
-            for prev in out[-50:]:  # 只检查最近 50 条
+            for prev in out[-200:]:
                 if is_dpo:
                     prev_text = prev["prompt"] + prev["chosen"] + prev.get("rejected", "")
                 else:
@@ -621,85 +587,47 @@ class DistillEngine:
 
     # ========== 批量运行 ==========
 
-    def run(self) -> list:
-        """执行完整的蒸馏流程"""
-=======
-            "temperature": cfg.temperature,
-        }
-        url = f"{cfg.resolved_base_url.rstrip('/')}/v1/chat/completions"
+    def run(self, resume_from: Optional[str] = None,
+            seen_prompts: Optional[set] = None) -> list:
+        """执行完整的蒸馏流程
 
-        for attempt in range(3):
-            try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=120)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data["choices"][0]["message"]["content"]
-                body = resp.text[:300]
-                print(f"  HTTP {resp.status_code} (尝试 {attempt+1}/3): {body}")
-                if attempt < 2:
-                    time.sleep(2)
-            except requests.exceptions.ConnectionError:
-                print(f"  ⚠ 连接失败 (尝试 {attempt+1}/3): 无法连接到 {url}")
-                print(f"    请检查 --base-url 是否正确、网络是否可达")
-                time.sleep(3)
-            except requests.exceptions.Timeout:
-                print(f"  ⚠ 超时 (尝试 {attempt+1}/3): 请求超时 ({120}s)")
-                time.sleep(3)
-            except Exception as e:
-                print(f"  ⚠ 请求异常 (尝试 {attempt+1}/3): {e}")
-                time.sleep(2)
-        return ""
-
-    def generate_one(self, item: dict, use_cot: bool) -> Optional[dict]:
-        prompt = item["prompt"]
-        data_type = item.get("type", "code")
-        identity = self.config.identity
-
-        if use_cot:
-            full_prompt = f"{identity}\n\n{prompt}\n\n请先逐步思考，再给出最终答案。"
-        else:
-            full_prompt = f"{identity}\n\n{prompt}"
-
-        try:
-            if self._use_requests:
-                response = self._generate_via_requests(full_prompt)
-            else:
-                response = self.teacher.generate(
-                    full_prompt,
-                    max_tokens=self.config.max_tokens,
-                    temperature=self.config.temperature,
-                )
-        except Exception as e:
-            print(f"  ✗ 生成失败: {e}")
-            return None
-
-        if not response or len(response.strip()) < 10:
-            reason = "空响应" if not response else f"过短 ({len(response.strip())} 字符)"
-            if response and len(response.strip()) < 10:
-                print(f"  ✗ 跳过: {reason} — 响应内容: {response.strip()[:60]}")
-            return None
-
-        strategy = "cot" if use_cot else "direct"
-        result = {
-            "response": response.strip(),
-            "strategy": strategy,
-            "source": "zhengliu",
-        }
-        result.update(item)
-        return result
-
-    def run(self) -> list:
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
+        BUG-D2 fix: 支持 --resume 从 checkpoint 文件续传。
+        BUG-D1 fix: 使用线程安全计数器。
+        """
         cfg = self.config
+
+        # BUG-D2: resume from checkpoint
+        existing_results = []
+        completed_prompts = set()
+        if seen_prompts:
+            completed_prompts = seen_prompts
+        if resume_from and os.path.exists(resume_from):
+            with open(resume_from, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            r = json.loads(line)
+                            existing_results.append(r)
+                            # Track completed prompts to skip them
+                            pk = r.get("prompt", "")[:200]
+                            completed_prompts.add(hashlib.md5(pk.encode()).hexdigest())
+                        except json.JSONDecodeError:
+                            pass
+            self._print(f"续传: 已有 {len(existing_results)} 条结果从 {resume_from}")
 
         all_items = []
         for dtype, count in cfg.type_counts.items():
-<<<<<<< HEAD
             for p in generate_prompts(dtype, count):
                 if isinstance(p, str):
-                    all_items.append({"prompt": p, "type": dtype})
+                    item = {"prompt": p, "type": dtype}
                 else:
-                    item = {"type": dtype}; item.update(p); all_items.append(item)
+                    item = {"type": dtype}; item.update(p)
+                # BUG-D2: skip already completed prompts
+                pk = item.get("prompt", "")[:200]
+                if hashlib.md5(pk.encode()).hexdigest() in completed_prompts:
+                    continue
+                all_items.append(item)
 
         total = len(all_items)
         is_dpo = cfg.mode == "dpo"
@@ -707,82 +635,87 @@ class DistillEngine:
         if cfg.dry_run:
             return self._dry_run(all_items, is_dpo)
 
-        self._print(f"开始蒸馏: {total} 条, 模式={'DPO' if is_dpo else 'SFT'}")
+        self._print(f"开始蒸馏: {total} 条 (新), 模式={'DPO' if is_dpo else 'SFT'}")
+        if existing_results:
+            self._print(f"  加上续传 {len(existing_results)} 条 = 总目标 {total + len(existing_results)} 条")
         for dtype, c in cfg.type_counts.items():
             self._print(f"  {dtype}: {c}")
 
         self._maybe_start_dashboard(total, cfg)
 
-        results = []
-        done = success = fail = consec_fail = 0
+        results = list(existing_results)  # BUG-D2: start with existing results
+        # BUG-D1 fix: thread-safe counters
+        self._done = 0
+        self._success = len(existing_results)
+        self._fail = 0
+        self._consec_fail = 0
         _FAIL_ABORT = max(10, total // 10)  # 连续失败超过 10% 则熔断
+        _checkpoint_interval = max(50, total // 10)  # BUG-D2: periodic checkpoint
 
         def worker(item):
             use_cot = not cfg.no_cot and item.get("type") in ("reasoning", "deep_reasoning", "error_reasoning")
             if item.get("type") == "reasoning_graph":
                 return self.generate_sft(item, use_cot)
             return self.generate_dpo(item, use_cot) if is_dpo else self.generate_sft(item, use_cot)
-=======
-            prompts = generate_prompts(dtype, count)
-            for p in prompts:
-                if isinstance(p, str):
-                    all_items.append({"prompt": p, "type": dtype})
-                else:
-                    item = {"type": dtype}
-                    item.update(p)
-                    all_items.append(item)
-
-        print(f"共 {len(all_items)} 条种子 prompt")
-        for dtype, count in cfg.type_counts.items():
-            print(f"  {dtype}: {count} 条")
-
-        # 预览模式：只打印不调 API
-        if cfg.dry_run:
-            print("\n=== 预览模式 (--dry-run) ===")
-            for i, item in enumerate(all_items, 1):
-                print(f"\n--- [{item.get('type','?')}] Prompt {i} ---")
-                print(item["prompt"][:500])
-                if len(item["prompt"]) > 500:
-                    print(f"... (共 {len(item['prompt'])} 字符)")
-            print(f"\n共 {len(all_items)} 条 prompt，未调用 API")
-            return []
-
-        print("\n开始蒸馏...")
-
-        results = []
-        done = 0
-
-        def worker(item):
-            use_cot = not cfg.no_cot and item.get("type") in ("reasoning", "deep_reasoning")
-            return self.generate_one(item, use_cot=use_cot)
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
 
         with ThreadPoolExecutor(max_workers=cfg.workers) as pool:
-            futures = [pool.submit(worker, item) for item in all_items]
+            futures = {pool.submit(worker, item): item for item in all_items}
             for f in as_completed(futures):
                 r = f.result()
-<<<<<<< HEAD
-                done += 1
-                dtype = r.get("type", "?") if r else "?"
-                if r:
-                    results.append(r); success += 1; consec_fail = 0
-                    # 传递 sample 预览和质量分到仪表盘
-                    preview = r.get("response", r.get("chosen", ""))[:80].strip()
-                    qs = r.get("quality_score", None)
-                    self._update_progress(done, total, success, fail,
-                                          by_type=dtype,
-                                          sample={"type": dtype, "text": preview, "quality": qs},
-                                          quality_score=qs)
-                else:
-                    fail += 1; consec_fail += 1
-                    if consec_fail >= _FAIL_ABORT:
-                        self._print(f"⚠ 连续失败 {consec_fail} 次, 熔断 — 模型不可用")
-                        break
-                    self._update_progress(done, total, success, fail)
+                with self._counter_lock:  # BUG-D1: thread-safe update
+                    self._done += 1
+                    dtype = r.get("type", "?") if r else "?"
+                    if r:
+                        results.append(r)
+                        self._success += 1
+                        self._consec_fail = 0
+                        preview = r.get("response", r.get("chosen", ""))[:80].strip()
+                        qs = r.get("quality_score", None)
+                    else:
+                        self._fail += 1
+                        self._consec_fail += 1
+
+                # Update dashboard/progress
+                self._update_progress(self._done, total, self._success, self._fail,
+                                      by_type=dtype if r else None,
+                                      sample={"type": dtype, "text": preview, "quality": qs} if r else None,
+                                      quality_score=qs if r else None)
+
+                # BUG-D1: check abort condition under lock
+                with self._counter_lock:
+                    should_abort = self._consec_fail >= _FAIL_ABORT
+                if should_abort:
+                    self._print(f"⚠ 连续失败 {self._consec_fail} 次, 熔断 — 模型不可用")
+                    break
+
+                # BUG-D2: periodic checkpoint
+                with self._counter_lock:
+                    current_done = self._done
+                if current_done % _checkpoint_interval == 0 and current_done > 0:
+                    self._save_checkpoint(results, is_dpo)
 
         self._maybe_stop_dashboard()
 
+        # BUG-D4: print token usage summary
+        self._print(f"\nToken 用量: prompt={self._token_usage['prompt_tokens']:,} "
+                     f"completion={self._token_usage['completion_tokens']:,} "
+                     f"total={self._token_usage['total_tokens']:,}")
+        # Rough cost estimate (DeepSeek pricing: input $0.14/M, output $0.28/M)
+        input_cost = self._token_usage["prompt_tokens"] * 0.14 / 1e6
+        output_cost = self._token_usage["completion_tokens"] * 0.28 / 1e6
+        self._print(f"估算成本: ${input_cost + output_cost:.4f}")
+
         return self._semantic_dedup(results, is_dpo)
+
+    def _save_checkpoint(self, results: list, is_dpo: bool):
+        """BUG-D2 fix: 保存中间结果到 checkpoint 文件"""
+        cfg = self.config
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        ckpt_path = os.path.join(cfg.output_dir, "_checkpoint.jsonl")
+        with open(ckpt_path, "w", encoding="utf-8") as f:
+            for r in results:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        self._print(f"Checkpoint: {len(results)} 条 → {ckpt_path}")
 
     def _dry_run(self, items, is_dpo):
         print("\n=== 预览模式 (--dry-run) ===")
@@ -829,39 +762,26 @@ class DistillEngine:
 def main():
     """CLI 入口 — python -m zhengliu.distill 或 zl"""
     from zhengliu.config import parse_args
-=======
-                if r:
-                    results.append(r)
-                done += 1
-                if done % 10 == 0 or done == len(all_items):
-                    pct = done / len(all_items) * 100
-                    bar_len = 20
-                    filled = int(bar_len * done / len(all_items))
-                    bar = "█" * filled + "░" * (bar_len - filled)
-                    print(f"  [{bar}] {done}/{len(all_items)} ({pct:.0f}%) 成功: {len(results)}")
-
-        # 去重
-        seen = set()
-        deduped = []
-        for r in results:
-            h = hashlib.md5((r["prompt"] + r["response"]).encode()).hexdigest()
-            if h not in seen:
-                seen.add(h)
-                deduped.append(r)
-
-        return deduped
-
-
-def main():
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
     cfg = parse_args()
     engine = DistillEngine(cfg)
-    data = engine.run()
+    # BUG-D2: support --resume from checkpoint
+    resume_from = None
+    if cfg.resume:
+        ckpt_dir = cfg.output_dir
+        ckpt_path = os.path.join(ckpt_dir, "_checkpoint.jsonl")
+        if os.path.exists(ckpt_path):
+            resume_from = ckpt_path
+        else:
+            # Try latest output file
+            if os.path.exists(ckpt_dir):
+                files = [f for f in os.listdir(ckpt_dir) if f.endswith(".jsonl") and not f.startswith("_")]
+                if files:
+                    resume_from = os.path.join(ckpt_dir, sorted(files)[-1])
+    data = engine.run(resume_from=resume_from)
 
     if cfg.dry_run:
         return
 
-<<<<<<< HEAD
     # 质量审查管线
     if cfg.quality_review and data:
         print("\n▶ 质量审查管线启动...")
@@ -896,26 +816,6 @@ def main():
     else:
         print("建议: 1) python -m zhengliu --dry-run --code 5 预览")
         print("      2) 检查 --api-key / --base-url / --model")
-=======
-    os.makedirs(cfg.output_dir, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(cfg.output_dir, f"{ts}_distilled_sft.jsonl")
-    with open(out_path, "w", encoding="utf-8") as f:
-        for r in data:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    total_attempted = sum(cfg.type_counts.values())
-    by_type = Counter(r["type"] for r in data)
-    print(f"\n完成！{len(data)} 条有效数据（共尝试 {total_attempted} 条，失败 {total_attempted - len(data)} 条）")
-    if data:
-        print(f"输出: {out_path}")
-        print(f"类型分布: {dict(by_type)}")
-    else:
-        print("建议:")
-        print("  1. python3 -m zhengliu.distill --dry-run --code 5  先预览 prompt")
-        print("  2. 检查 --api-key / --base-url / --model 是否正确")
-        print("  3. 确认 Teacher API 服务可用")
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
 
 
 if __name__ == "__main__":

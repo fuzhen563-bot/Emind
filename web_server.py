@@ -10,6 +10,7 @@ import asyncio
 import json
 import re
 import os
+import sys
 import glob
 import random
 import threading
@@ -79,7 +80,7 @@ except ImportError:
 # Simple Session Middleware (no itsdangerous dependency)
 # ============================================================================
 
-_SESSION_SECRET = os.urandom(32).hex()
+_SESSION_SECRET = os.environ.get("EMIND_SESSION_SECRET", os.urandom(32).hex())
 
 class SessionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -215,22 +216,24 @@ def resolve_mode(message: str):
 
 
 def build_prompt(messages, system_prompt: str) -> str:
-    """Build prompt from messages list for local models"""
-    parts = [f"系统: {system_prompt}"]
+    """Build ChatML prompt from messages list"""
+    parts = [f"<|im_start|>system\n{system_prompt}<|im_end|>"]
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if role == "user":
-            parts.append(f"用户: {content}")
+            parts.append(f"<|im_start|>user\n{content}<|im_end|>")
         elif role == "assistant":
-            parts.append(f"助手: {content}")
-    parts.append("助手:")
+            parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+    parts.append("<|im_start|>assistant\n")
     return "\n".join(parts)
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token count estimate for display purposes"""
-    return len(text) * 3 // 2
+    """Rough token count estimate: 中文≈1.5字/token, 英文≈4字/token"""
+    zh_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    en_count = len(text) - zh_count
+    return int(zh_count * 1.5 + en_count * 0.25) + 1
 
 
 # ============================================================================
@@ -405,21 +408,46 @@ class SessionManager:
 
 session_mgr = SessionManager()
 _global_engine = None
+_arena_model_pool: Dict[str, UnifiedInferenceEngine] = {}
+
 
 def get_engine() -> UnifiedInferenceEngine:
     global _global_engine
+
     if _global_engine is None:
-        # 优先尝试加载本地 checkpoint
-        model_path = None
-        for i, arg in enumerate(sys.argv[1:]):
-            if arg == "--model" and i + 1 < len(sys.argv[1:]):
-                model_path = sys.argv[i + 2]
-                break
-        if model_path and os.path.exists(model_path):
+        model_path = os.getenv("EMIND_MODEL_PATH", config_model_path)
+        if model_path:
             _global_engine = create_inference_engine("local", model_path=model_path)
         else:
             _global_engine = create_inference_engine("cloud_api")
     return _global_engine
+
+
+_ARENA_MODEL_ALIASES = {
+    "emind-7b": "auto",
+    "emind-fast": "local",
+    "emind-deep": "auto",
+}
+
+
+def _init_arena_pool():
+    global _arena_model_pool
+    models = list(_ARENA_MODEL_ALIASES.keys())
+    print(f"初始化竞技场模型池 ({len(models)} 个): {models}")
+    for alias in models:
+        try:
+            backend_type = _ARENA_MODEL_ALIASES[alias]
+            if alias == "emind-fast" and get_engine().is_available():
+                _arena_model_pool[alias] = get_engine()
+            else:
+                engine = create_inference_engine(backend_type)
+                if engine and engine.is_available():
+                    _arena_model_pool[alias] = engine
+                    print(f"  竞技场模型 [{alias}] 加载成功")
+                else:
+                    print(f"  竞技场模型 [{alias}] 不可用")
+        except Exception as e:
+            print(f"  竞技场模型 [{alias}] 加载失败: {e}")
 
 
 def _update_context(chat_session: ChatSession):
@@ -694,23 +722,15 @@ async def arena_compare(req: ArenaRequest):
         raise HTTPException(400, "请选择至少 2 个模型")
 
     results = []
-    from unified_inference import OllamaBackend, LocalModelBackend
 
     for model_ref in req.models:
         try:
-            if model_ref == "emind-7b":
-                engine = create_inference_engine("auto")
-            elif model_ref == "emind-fast":
-                if get_engine().is_available():
-                    engine = get_engine()
-                else:
-                    engine = create_inference_engine("local")
-            elif model_ref == "emind-deep":
-                engine = create_inference_engine("auto")
-            else:
-                engine = get_engine()
+            engine = _arena_model_pool.get(model_ref)
+            if engine is None:
+                results.append({"model": model_ref, "response": None, "error": "模型未预加载"})
+                continue
 
-            if engine and engine.is_available():
+            if engine.is_available():
                 config = BackendConfig(
                     backend_type=engine.config.backend_type,
                     model_name=engine.config.model_name,
@@ -986,8 +1006,8 @@ async def openai_compatible_chat(req: OpenAIRequest):
     if req.tools:
         system_prompt += _build_tool_prompt(req.tools)
 
-    # Build conversation with full history
-    conversation_parts = []
+    # Build ChatML conversation
+    chatml_parts = [f"<|im_start|>system\n{system_prompt}<|im_end|>"]
     for msg in req.messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
@@ -995,21 +1015,23 @@ async def openai_compatible_chat(req: OpenAIRequest):
             system_prompt = content
             if req.tools:
                 system_prompt += _build_tool_prompt(req.tools)
+            chatml_parts[-1] = f"<|im_start|>system\n{system_prompt}<|im_end|>"
+            continue
         elif role == "user":
-            conversation_parts.append(f"用户: {content}")
+            chatml_parts.append(f"<|im_start|>user\n{content}<|im_end|>")
         elif role == "assistant":
             tool_calls = msg.get("tool_calls")
             if tool_calls:
                 for tc in tool_calls:
                     fn = tc.get("function", {})
-                    conversation_parts.append(f"助手: [调用工具 {fn.get('name', '')} 参数 {fn.get('arguments', '')}]")
+                    chatml_parts.append(f"<|im_start|>assistant\n[调用工具 {fn.get('name', '')} 参数 {fn.get('arguments', '')}]<|im_end|>")
             else:
-                conversation_parts.append(f"助手: {content}")
+                chatml_parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
         elif role == "tool":
-            conversation_parts.append(f"工具结果: {content}")
+            chatml_parts.append(f"<|im_start|>tool\n{content}<|im_end|>")
 
-    conversation_parts.append("助手:")
-    user_message = "\n".join(conversation_parts)
+    chatml_parts.append("<|im_start|>assistant\n")
+    user_message = "\n".join(chatml_parts)
 
     engine = get_engine()
 
@@ -1017,7 +1039,7 @@ async def openai_compatible_chat(req: OpenAIRequest):
         response_text = ""
         try:
             if engine and engine.is_available():
-                prompt = f"系统: {system_prompt}\n{user_message}"
+                prompt = user_message
                 config = BackendConfig(
                     backend_type=engine.config.backend_type,
                     model_name=engine.config.model_name,
@@ -1242,6 +1264,9 @@ if __name__ == "__main__":
     if engine:
         info = engine.get_backend_info()
         print(f"  后端: {info['backend_type']} | 可用: {info['is_available']}")
+
+    _init_arena_pool()
+    print(f"  竞技场模型池: {list(_arena_model_pool.keys())}")
     print(f"  地址: http://localhost:{port}")
     print(f"  API 文档: http://localhost:{port}/docs")
 

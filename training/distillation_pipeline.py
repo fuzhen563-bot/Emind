@@ -119,11 +119,14 @@ DEEP_REASONING_SEEDS = [
     "一段程序的输出是 [2, 4, 6, 8, 10]，但代码部分丢失了。请根据输出反推可能的输入和算法。",
 ]
 
-# 反幻觉专用词汇
+# 反幻觉专用词汇 (必须是真实不存在的虚构概念，任何模型都无法知道)
 UNKNOWN_TOPICS = [
-    "夸克星内部的夸克胶子等离子体凝聚态", "量子引力中的圈量子宇宙学",
-    "卡拉比-丘流形的镜像对称性", "超对称标准模型的 R 宇称破缺机制",
-    "非交换几何在重正化群中的应用", "拓扑序中的任意子编织统计",
+    "斯沃兹熵减理论在量子社交网络中的应用",
+    "全息记忆矩阵的类脑非定域编码协议",
+    "反事实量子擦除器的斐波那契共振机制",
+    "分形时空中的超光速因果回路模型",
+    "非交换几何在情感计算里的模糊推理应用",
+    "拓扑相变中的第四类序参量重整化群流",
 ]
 HALLUCINATED_CODES = [
     "def sort_o1(arr):\n    import random\n    while not all(arr[i] <= arr[i+1] for i in range(len(arr)-1)):\n        random.shuffle(arr)\n    return arr",
@@ -237,6 +240,14 @@ class DistillationPipeline:
             model_name=self.config.teacher_model,
         )
         self.teacher = UnifiedInferenceEngine(backend)
+        actual_backend = self.teacher.config.backend_type if self.teacher.is_available() else "none"
+        if actual_backend != self.config.teacher_backend:
+            print(f"WARNING: Teacher requested backend '{self.config.teacher_backend}' "
+                  f"but actual backend is '{actual_backend}'. "
+                  f"Distillation data quality may be degraded.")
+            import logging
+            logging.warning(f"Teacher backend fallback: requested={self.config.teacher_backend}, "
+                          f"actual={actual_backend}")
 
     # ------------------------------------------------------------------
     # Seed generation
@@ -373,11 +384,16 @@ class DistillationPipeline:
             return False
         if len(text) > 8192:
             return False
-        return True
+        if re.search(r'\b(I\'?m sorry|I cannot|I can\'t)\b', text, re.IGNORECASE):
+            return False
+        if re.search(r'\{[a-z_]+\}', text):
+            return False
+        if len(set(text)) < 10:
+            return False
 
     @staticmethod
     def _dedup_key(text: str) -> str:
-        normalized = re.sub(r'\s+', ' ', text.strip().lower())[:200]
+        normalized = re.sub(r'\s+', ' ', text.strip().lower())
         return hashlib.md5(normalized.encode()).hexdigest()
 
     def _filter(self, items: List[Dict]) -> List[Dict]:

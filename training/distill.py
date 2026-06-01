@@ -22,10 +22,14 @@ class DistillationDataset(Dataset):
         item = self.data[idx]
         text = item if isinstance(item, str) else item.get("text", item.get("prompt", ""))
         ids = self.tokenizer.encode(text)[:self.max_seq_len]
-        pad = [self.pad_token_id] * (self.max_seq_len - len(ids))
+        labels = ids.copy()
+        pad_len = self.max_seq_len - len(ids)
+        if pad_len > 0:
+            ids = ids + [pad_token_id] * pad_len
+            labels = labels + [-100] * pad_len
         return {
-            "input_ids": torch.tensor(ids + pad, dtype=torch.long),
-            "labels": torch.tensor(ids + pad, dtype=torch.long),
+            "input_ids": torch.tensor(ids[:self.max_seq_len], dtype=torch.long),
+            "labels": torch.tensor(labels[:self.max_seq_len], dtype=torch.long),
         }
 
 
@@ -75,6 +79,7 @@ class DistillationTrainer(TrainerBase):
 
         log_softmax_s = F.log_softmax(shift_student / self.temperature, dim=-1)
         softmax_t = F.softmax(shift_teacher / self.temperature, dim=-1)
-        loss_ce = -(log_softmax_s * softmax_t * mask).sum(-1).mean() * (self.temperature ** 2)
+        ce_per_token = -(log_softmax_s * softmax_t).sum(-1)
+        loss_ce = (ce_per_token * mask.squeeze(-1)).sum() / mask.sum() * (self.temperature ** 2)
 
         return self.alpha_clm * loss_clm + self.alpha_ce * loss_ce + s_aux

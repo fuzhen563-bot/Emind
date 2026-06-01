@@ -4,13 +4,15 @@ import torch.distributed as dist
 
 
 def init_distributed():
-    if not dist.is_available() or not dist.is_nccl_available():
+    if not dist.is_available():
         return None, 1
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
     return rank, world_size
 
 

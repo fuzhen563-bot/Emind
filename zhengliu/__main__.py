@@ -1,5 +1,4 @@
 """
-<<<<<<< HEAD
 zhengliu 蒸馏工具箱 — 交互式菜单
 
 用法:
@@ -86,21 +85,29 @@ def _get_config(mode="sft", extra=None):
     return cfg
 
 
+def _prompt_resume() -> str:
+    """询问是否从之前的 checkpoint 继续"""
+    r = input("\n从 checkpoint 继续? (留空=否, 输入 checkpoint 路径): ").strip()
+    return r if r else ""
+
+
 def cmd_sft():
     cfg = _get_config("sft")
     if not cfg: return
+    resume_from = _prompt_resume()
     print("\n▶ 基础蒸馏启动...")
     eng = DistillEngine(cfg)
-    data = eng.run()
+    data = eng.run(resume_from=resume_from or None)
     if data: _save(cfg, data, "sft")
     input("\n按回车返回...")
 
 def cmd_dpo():
     cfg = _get_config("dpo")
     if not cfg: return
+    resume_from = _prompt_resume()
     print("\n▶ 进阶蒸馏 (DPO) 启动...")
     eng = DistillEngine(cfg)
-    data = eng.run()
+    data = eng.run(resume_from=resume_from or None)
     if data: _save(cfg, data, "dpo")
     input("\n按回车返回...")
 
@@ -117,9 +124,10 @@ def cmd_quality():
     cfg = _get_config("sft", lambda c: (setattr(c, "quality_check", True),
                                          setattr(c, "multi_turn_correct", True)))
     if not cfg: return
+    resume_from = _prompt_resume()
     print("\n▶ 质量控制蒸馏启动...")
     eng = DistillEngine(cfg)
-    data = eng.run()
+    data = eng.run(resume_from=resume_from or None)
     if data: _save(cfg, data, "sft")
     input("\n按回车返回...")
 
@@ -201,9 +209,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-=======
-python -m zhengliu 入口
-"""
-from zhengliu.distill import main
-main()
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329

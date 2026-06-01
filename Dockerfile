@@ -34,3 +34,5 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
 
 ENTRYPOINT ["python", "cli.py"]
 CMD ["serve", "--port", "3333"]
+
+# 蒸馏工具箱入口: docker run <image> python -m zhengliu

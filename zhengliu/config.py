@@ -1,9 +1,5 @@
 """
-<<<<<<< HEAD
 蒸馏配置 — 完整参数定义和 CLI 解析
-=======
-蒸馏配置
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
 """
 import os
 import argparse
@@ -13,7 +9,6 @@ from typing import Optional, Dict
 
 @dataclass
 class DistillConfig:
-<<<<<<< HEAD
     # === Teacher 连接 ===
     teacher: str = "deepseek"
     api_key: str = ""
@@ -58,32 +53,15 @@ class DistillConfig:
     auto_discover: bool = True   # 自动发现 API 可用模型
     exclude_models: str = ""     # 排除模型, 逗号分隔
 
+    # === 断点续蒸馏 ===
+    resume: bool = False
+
     # === 可视化 ===
     no_visual: bool = False
 
     # ========== 计算属性 ==========
     BACKEND_MAP = {"deepseek": "cloud_api", "openai": "cloud_api", "ollama": "ollama",
                    "vllm": "vllm", "huggingface": "huggingface", "local": "local"}
-=======
-    teacher: str = "deepseek"
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
-    model: Optional[str] = None
-    identity: str = "你是一个名为 Emind·智脑 的 AI 助手，由亦梓科技开发。"
-    type_counts: Dict[str, int] = field(default_factory=lambda: {"code": 20, "reasoning": 10})
-    max_tokens: int = 2048
-    temperature: float = 0.7
-    workers: int = 5
-    output_dir: str = "zhengliu/output"
-    no_cot: bool = False
-    dry_run: bool = False
-
-    BACKEND_MAP = {
-        "deepseek": "cloud_api", "openai": "cloud_api",
-        "ollama": "ollama", "vllm": "vllm",
-        "huggingface": "huggingface", "local": "local",
-    }
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
     MODEL_MAP = {"deepseek": "deepseek-v4-flash"}
     BASE_URL_MAP = {"deepseek": "https://api.deepseek.com"}
 
@@ -103,7 +81,6 @@ class DistillConfig:
     def resolved_api_key(self) -> str:
         return self.api_key or os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
 
-<<<<<<< HEAD
     @property
     def total_attempted(self) -> int:
         return sum(self.type_counts.values())
@@ -171,6 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-discover", action="store_false", dest="discover", help="关闭自动发现模型")
     g.add_argument("--exclude-models", default="", help="排除模型 (逗号分隔)")
 
+    # 断点续蒸馏
+    p.add_argument("--resume", action="store_true", help="从上次 checkpoint 续蒸馏")
+
     # 可视化
     p.add_argument("--no-visual", action="store_true", help="纯文本进度")
 
@@ -180,59 +160,16 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv=None) -> DistillConfig:
     p = build_parser()
     args = p.parse_args(argv)
-=======
-
-def parse_args(argv=None) -> DistillConfig:
-    parser = argparse.ArgumentParser(
-        prog="zhengliu",
-        description="蒸馏 — 用 Teacher 模型生成 SFT 数据并打包为 JSONL",
-    )
-    # Teacher 后端
-    parser.add_argument("--teacher", default="deepseek",
-                        choices=["deepseek", "openai", "ollama", "vllm", "huggingface", "local"],
-                        help="Teacher 模型后端")
-    parser.add_argument("--api-key", default=None, help="API key")
-    parser.add_argument("--base-url", default=None, help="API base URL")
-    parser.add_argument("--model", default=None, help="模型名或路径")
-    # 身份设定
-    parser.add_argument("--identity", default=None,
-                        help="Teacher 的身份提示（默认: 你是一个名为 Emind·智脑 的 AI 助手，由亦梓科技开发。）")
-    # 数据量
-    parser.add_argument("--code", type=int, default=0, help="代码数据条数")
-    parser.add_argument("--reasoning", type=int, default=0, help="推理数据条数")
-    parser.add_argument("--deep-reasoning", type=int, default=0, help="深度推理数据条数")
-    parser.add_argument("--anti-hallucination", type=int, default=0, help="反幻觉数据条数")
-    parser.add_argument("--identity-data", type=int, default=0, help="身份认知数据条数")
-    parser.add_argument("--all", type=int, default=0, help="每种类型各 N 条（快捷方式）")
-    # 生成参数
-    parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--workers", type=int, default=5, help="并行线程数")
-    parser.add_argument("--output-dir", default="zhengliu/output", help="输出目录")
-    parser.add_argument("--no-cot", action="store_true", help="禁用 CoT 策略")
-    parser.add_argument("--dry-run", action="store_true", help="仅预览生成的 prompt，不调用 API")
-
-    args = parser.parse_args(argv)
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
 
     type_counts = {}
     if args.all:
         for t in ("code", "reasoning", "deep_reasoning", "anti_hallucination", "identity"):
             type_counts[t] = args.all
     else:
-<<<<<<< HEAD
         pairs = [("code","code"), ("reasoning","reasoning"), ("deep_reasoning","deep_reasoning"),
                  ("anti_hallucination","anti_hallucination"), ("identity_data","identity"),
                  ("noise_code","noise_code"), ("failure_path","failure_path"),
                  ("uncertainty","uncertainty"), ("long_conversation","long_conversation")]
-=======
-        pairs = [
-            ("code", "code"), ("reasoning", "reasoning"),
-            ("deep_reasoning", "deep_reasoning"),
-            ("anti_hallucination", "anti_hallucination"),
-            ("identity_data", "identity"),
-        ]
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
         for attr, key in pairs:
             v = getattr(args, attr, 0)
             if v:
@@ -242,7 +179,6 @@ def parse_args(argv=None) -> DistillConfig:
         type_counts = {"code": 20, "reasoning": 10}
 
     return DistillConfig(
-<<<<<<< HEAD
         teacher=args.teacher, api_key=args.api_key, base_url=args.base_url, model=args.model,
         identity=args.identity or "你是一个名为 Emind·智脑 的 AI 助手，由亦梓科技开发。",
         type_counts=type_counts,
@@ -255,19 +191,5 @@ def parse_args(argv=None) -> DistillConfig:
         quality_review=args.quality_review,
         dpo_chosen_temp=args.dpo_chosen_temp, dpo_rejected_temp=args.dpo_rejected_temp,
         auto_runs=args.auto_runs, auto_models=args.auto_models, auto_discover=args.discover,
-        exclude_models=args.exclude_models, no_visual=args.no_visual,
-=======
-        teacher=args.teacher,
-        api_key=args.api_key,
-        base_url=args.base_url,
-        model=args.model,
-        identity=args.identity or "你是一个名为 Emind·智脑 的 AI 助手，由亦梓科技开发。",
-        type_counts=type_counts,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        workers=args.workers,
-        output_dir=args.output_dir,
-        no_cot=args.no_cot,
-        dry_run=args.dry_run,
->>>>>>> 9939223c9f77b60566d21c4fc14d8f2562361329
+        exclude_models=args.exclude_models, resume=args.resume, no_visual=args.no_visual,
     )

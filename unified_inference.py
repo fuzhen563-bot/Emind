@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from typing import Optional, Dict, Any, List, Generator, Callable
 from dataclasses import dataclass, field, replace
 from abc import ABC, abstractmethod
@@ -510,9 +511,22 @@ class CloudAPIBackend(BaseBackend):
         return self._models
 
     def _build_messages(self, prompt: str) -> List[Dict]:
-        """将简单 prompt 转为 OpenAI messages 格式"""
-        lines = prompt.split("\n")
+        """Convert prompt to OpenAI messages format (ChatML or traditional)"""
         messages = []
+        if "<|im_start|>" in prompt:
+            for block in prompt.split("<|im_end|>"):
+                block = block.strip()
+                if not block:
+                    continue
+                m = re.match(r"<\|im_start\|>(\w+)\n(.*)", block, re.DOTALL)
+                if m:
+                    role = m.group(1)
+                    if role in ("system", "user", "assistant", "tool"):
+                        messages.append({"role": role, "content": m.group(2).strip()})
+            if not messages:
+                messages.append({"role": "user", "content": prompt})
+            return messages
+        lines = prompt.split("\n")
         for line in lines:
             if line.startswith("系统: "):
                 messages.append({"role": "system", "content": line[4:]})
@@ -636,14 +650,12 @@ class LocalModelBackend(BaseBackend):
         return self.model is not None
 
     def generate(self, prompt: str, config: BackendConfig = None, **kwargs) -> str:
-        """同步生成"""
         if not self.is_available():
             return "模型未加载"
 
         if config is None:
             config = self.config
 
-        # 编码
         encoded = self.tokenizer.encode(prompt)
         if len(encoded) > config.n_ctx:
             encoded = encoded[-config.n_ctx:]
@@ -651,45 +663,20 @@ class LocalModelBackend(BaseBackend):
         device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         input_ids = torch.tensor([encoded], dtype=torch.long).to(device)
 
-        # 生成
-        generated = []
-        eos_token_id = getattr(self.tokenizer, 'eos_token_id', 3)
-
         with torch.no_grad():
-            for _ in range(config.max_tokens):
-                logits = self.model(input_ids)[1][:, -1, :]
+            gen_ids = self.model.generate(
+                input_ids,
+                max_new_tokens=config.max_tokens,
+                temperature=config.temperature,
+                top_k=config.top_k,
+                top_p=config.top_p,
+                eos_token_id=getattr(self.tokenizer, 'eos_token_id', 3),
+            )
 
-                # 温度采样
-                if config.temperature > 0:
-                    logits = logits / config.temperature
-
-                # Top-k
-                if config.top_k > 0:
-                    indices_to_remove = logits < torch.topk(logits, config.top_k)[0][..., -1, None]
-                    logits[indices_to_remove] = float('-inf')
-
-                # Top-p (nucleus)
-                if config.top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cum_probs > config.top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    indices_to_remove = sorted_indices_to_remove.scatter(
-                        dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-                    )
-                    logits[indices_to_remove] = float('-inf')
-
-                probs = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-
-                token_id = next_token.item()
-                if token_id == eos_token_id:
-                    break
-                generated.append(token_id)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-
-        return self.tokenizer.decode(generated)
+        new_tokens = gen_ids[0, input_ids.shape[1]:].tolist()
+        if new_tokens and new_tokens[-1] == getattr(self.tokenizer, 'eos_token_id', 3):
+            new_tokens = new_tokens[:-1]
+        return self.tokenizer.decode(new_tokens)
 
     def stream_generate(
         self,
@@ -697,14 +684,12 @@ class LocalModelBackend(BaseBackend):
         config: BackendConfig = None,
         callback: Callable[[str], None] = None
     ) -> Generator[str, None, None]:
-        """流式生成"""
         if not self.is_available():
             return
 
         if config is None:
             config = self.config
 
-        # 编码
         encoded = self.tokenizer.encode(prompt)
         if len(encoded) > config.n_ctx:
             encoded = encoded[-config.n_ctx:]
@@ -712,14 +697,23 @@ class LocalModelBackend(BaseBackend):
         device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         input_ids = torch.tensor([encoded], dtype=torch.long).to(device)
 
-        # 生成
         generated = []
         eos_token_id = getattr(self.tokenizer, 'eos_token_id', 3)
         decode = getattr(self.tokenizer, 'id_to_token', None)
 
+        n_layers = len(self.model.layers)
+        kv_caches = [None] * n_layers
+        cos, sin = self.model.rope_cos.to(device), self.model.rope_sin.to(device)
+        seq_len = input_ids.shape[1]
+
         with torch.no_grad():
+            x = self.model.token_embedding(input_ids)
+            mask = self.model.create_causal_mask(seq_len, device)
+            for i, layer in enumerate(self.model.layers):
+                x, kv_caches[i], _ = layer(x, cos[:seq_len], sin[:seq_len], mask, kv_caches[i])
+
             for _ in range(config.max_tokens):
-                logits = self.model(input_ids)[1][:, -1, :]
+                logits = self.model.lm_head(self.model.ln_f(x[:, -1:, :])).squeeze(1)
 
                 if config.temperature > 0:
                     logits = logits / config.temperature
@@ -737,7 +731,6 @@ class LocalModelBackend(BaseBackend):
                     break
 
                 generated.append(token_id)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
 
                 if decode:
                     decoded_char = decode(token_id)
@@ -748,8 +741,16 @@ class LocalModelBackend(BaseBackend):
                         callback(decoded_char)
                     yield decoded_char
 
-                if len(input_ids[0]) > config.n_ctx:
+                if len(input_ids[0]) + len(generated) > config.n_ctx:
                     break
+
+                x = self.model.token_embedding(next_token)
+                seq_len += 1
+                cos_step = cos[seq_len - 1:seq_len]
+                sin_step = sin[seq_len - 1:seq_len]
+                mask = torch.zeros(1, 1, 1, seq_len, device=device)
+                for i, layer in enumerate(self.model.layers):
+                    x, kv_caches[i], _ = layer(x, cos_step, sin_step, mask, kv_caches[i])
 
     # end of stream_generate
 

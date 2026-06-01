@@ -1,13 +1,15 @@
 """
 Pipeline — 一键自动蒸馏
   自动发现模型 → 轮询切换 → 无限/固定轮次 → 累积输出
+  支持 checkpoint/resume (V2.0)
 """
+import hashlib
 import json
 import os
 import sys
 import time
 import signal
-from typing import List
+from typing import List, Optional
 
 _pkg_dir = os.path.dirname(os.path.abspath(__file__))
 _parent = os.path.dirname(_pkg_dir)
@@ -32,6 +34,7 @@ class Pipeline:
         self.total_success = 0
         self._stop = False
         self._dead_models = set()  # 已确认不可用的模型
+        self._checkpoint_path: Optional[str] = None  # V2.0: checkpoint 路径
 
     def discover_models(self, verify: bool = True) -> list:
         """发现 + 验证 API 上所有可用模型，只保留通过预检的"""
@@ -120,7 +123,35 @@ class Pipeline:
         except Exception:
             return False
 
-    def auto_run(self) -> list:
+    # ── checkpoint 支持 ──────────────────────────────────────────────
+
+    def _load_checkpoint(self, path: str) -> List[str]:
+        """加载已有 checkpoint，返回已完成 prompt 的哈希集合 (跳过)"""
+        seen = set()
+        if not os.path.isfile(path):
+            print(f"  checkpoint 不存在: {path}")
+            return []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                h = hashlib.md5(line.encode()).hexdigest()
+                seen.add(h)
+        print(f"  加载 checkpoint: {path} ({len(seen)} 条已完成)")
+        return seen
+
+    def _save_checkpoint(self, path: str, results: list) -> None:
+        """增量保存蒸馏结果到 checkpoint"""
+        mode = "a" if os.path.exists(path) else "w"
+        with open(path, mode, encoding="utf-8") as f:
+            for r in results:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        self._checkpoint_path = path
+
+    # ── 主循环 ───────────────────────────────────────────────────────
+
+    def auto_run(self, resume_from: str = "") -> list:
         cfg = self.config
         signal.signal(signal.SIGINT, lambda s, f: self.stop())
 
@@ -149,7 +180,26 @@ class Pipeline:
         cumu_path = os.path.join(out_dir, f"{ts}_auto_distill.jsonl")
         log_path = os.path.join(out_dir, f"{ts}_auto_run.log")
 
+        # V2.0: checkpoint resume
+        seen_prompts = set()
+        if resume_from:
+            seen_prompts = set(self._load_checkpoint(resume_from))
+            self._checkpoint_path = resume_from
+        elif cfg.resume:
+            # 自动查找最新 checkpoint
+            candidates = sorted(
+                [f for f in os.listdir(out_dir) if f.endswith("_auto_distill.jsonl")],
+                reverse=True,
+            )
+            if candidates:
+                ckpt = os.path.join(out_dir, candidates[0])
+                seen_prompts = set(self._load_checkpoint(ckpt))
+                self._checkpoint_path = ckpt
+                resume_from = ckpt
+
         self._log(f"一键蒸馏启动 | 模型池:{len(self.model_pool)} | 轮次:{'无限' if infinite else max_runs}", log_path)
+        if resume_from:
+            self._log(f"续跑: {resume_from} (跳过 {len(seen_prompts)} 条)", log_path)
 
         run_idx = 0
         consecutive_fail = 0
@@ -183,14 +233,19 @@ class Pipeline:
                     engine = DistillEngine(cfg)
                 engine.config.model = mn
 
-                data = engine.run()
+                # V2.0: 传入 resume_from 让 DistillEngine 内部跳过已完成 prompt
+                data = engine.run(resume_from=resume_from or None, seen_prompts=seen_prompts)
                 if data:
                     ok = True
                     self.total_success += len(data)
                     cumulative.extend(data)
-                    with open(cumu_path, "a", encoding="utf-8") as f:
-                        for r in data:
-                            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    # 增量保存 checkpoint
+                    if self._checkpoint_path:
+                        self._save_checkpoint(self._checkpoint_path, data)
+                    else:
+                        with open(cumu_path, "a", encoding="utf-8") as f:
+                            for r in data:
+                                f.write(json.dumps(r, ensure_ascii=False) + "\n")
                     self._log(f"✓ {mn}: {len(data)} 条", log_path)
                     consecutive_fail = 0
                     # 清除 dead list (模型可能恢复)

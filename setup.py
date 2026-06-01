@@ -13,10 +13,11 @@ setup(
     description="亦梓·智脑 — 大语言模型训练推理框架",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    packages=find_packages(include=["Emind", "Emind.*", "training", "training.*", "data_pipeline", "data_pipeline.*", "eval", "eval.*"]),
+    packages=find_packages(include=["Emind", "Emind.*", "training", "training.*", "data_pipeline", "data_pipeline.*", "eval", "eval.*", "zhengliu", "zhengliu.*"]),
     entry_points={
         "console_scripts": [
             "emind=cli:main",
+            "zl=zhengliu.__main__:main",
         ],
     },
     classifiers=[

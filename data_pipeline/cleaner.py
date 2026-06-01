@@ -19,6 +19,8 @@ class DataCleaner:
         for item in items:
             if isinstance(item, dict) and key:
                 sig = str(item.get(key, ""))
+            elif isinstance(item, dict):
+                sig = json.dumps(item, sort_keys=True, ensure_ascii=False)
             else:
                 sig = str(item)
             if sig not in seen:
@@ -57,10 +59,12 @@ class DataCleaner:
         if not text:
             return 0.0
         score = 1.0
-        ascii_chars = sum(1 for c in text if 32 <= ord(c) < 127)
         total_chars = len(text)
+        code_keywords = ["def ", "class ", "import ", "return ", "function ", "var ", "let ", "const ", "#include", "pub fn"]
+        is_code = sum(1 for kw in code_keywords if kw in text) >= 2
+        ascii_chars = sum(1 for c in text if 32 <= ord(c) < 127)
         ascii_ratio = ascii_chars / total_chars if total_chars > 0 else 0
-        if ascii_ratio > 0.9:
+        if ascii_ratio > 0.9 and not is_code:
             score -= 0.3
         repeated = re.findall(r'(.)\1{4,}', text)
         if repeated:
@@ -82,8 +86,8 @@ class DataCleaner:
         text = re.sub(r'[\w.-]+@[\w.-]+\.\w+', mask_token, text)
         # IP 地址
         text = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', mask_token, text)
-        # 银行卡号 (16-19 digits)
-        text = re.sub(r'\d{16,19}', mask_token, text)
+        # 银行卡号 (16-19 digits, with word boundaries)
+        text = re.sub(r'\b\d{16,19}\b', mask_token, text)
         # 统一社会信用代码 (18位 数字+大写字母)
         text = re.sub(r'[A-Z0-9]{18}', mask_token, text)
         # 护照号 (e.g. E12345678)
@@ -114,13 +118,16 @@ class DataCleaner:
         return result
 
     def clean(self, items: List[Any], dedup_key: Optional[str] = None, text_field: Optional[str] = None,
-              target_lang: Optional[str] = None, quality_threshold: float = 0.0) -> List[Any]:
+              target_lang: Optional[str] = None, quality_threshold: float = 0.0,
+              strip_pii: bool = True) -> List[Any]:
         items = self.deduplicate(items, key=dedup_key)
         items = self.filter_length(items, text_field=text_field)
         if quality_threshold > 0:
             items = self.filter_quality(items, text_field=text_field, threshold=quality_threshold)
         if target_lang:
             items = self.filter_language(items, target=target_lang, text_field=text_field)
+        if strip_pii:
+            items = self.strip_pii_from_dataset(items)
         return items
 
     def strip_pii_from_dataset(self, items: List[Any], text_fields: Optional[List[str]] = None) -> List[Any]:
