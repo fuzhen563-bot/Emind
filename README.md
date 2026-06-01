@@ -1,6 +1,6 @@
 <div align="center">
   <img src="/logo.png" alt="Emind AI Logo" width="120">
-  <h1>Emind AI v2.0</h1>
+  <h1>Emind AI</h1>
   <h3>亦梓·智脑 — 让每个行业拥有自己的大模型</h3>
   <p>
     <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
@@ -21,7 +21,7 @@
 
 ---
 
-# Emind AI v2.0 文档
+# Emind 文档
 
 - [概述](#概述)
 - [行业垂类模型方案](#行业垂类模型方案)
@@ -36,7 +36,6 @@
 - [模型架构](#模型架构)
 - [训练管线详解](#训练管线详解)
 - [量化部署](#量化部署)
-- [工程路线图](#工程路线图)
 - [开发团队](#开发团队)
 - [许可](#许可)
 
@@ -44,7 +43,7 @@
 
 ## 概述
 
-**Emind v2.0** 是一个从零构建的生产级大语言模型框架，覆盖从 **数据蒸馏 → 模型训练 → 量化部署 → 推理服务** 的全链路。它的核心设计目标是：**让任何行业的团队都能在 1-2 天内构建属于自己的垂类大模型**。
+**Emind** 是一个从零构建的生产级大语言模型框架，覆盖从 **数据蒸馏 → 模型训练 → 量化部署 → 推理服务** 的全链路。它的核心设计目标是：**让任何行业的团队都能在 1-2 天内构建属于自己的垂类大模型**。
 
 传统上，训练一个大模型需要：
 - 海量 GPU 资源（数十万 $）
@@ -722,55 +721,6 @@ model = torch.load("model.pt", map_location="cpu", weights_only=False)
 qmodel = quantize_model(model, mode="int4", group_size=128)
 torch.save(qmodel, "model-int4.pt")
 print(estimate_model_size(qmodel, mode="int4"))
-```
-
----
-
-## 工程路线图
-
-### 第一阶段 ✅ 已完成
-
-```
-现代架构重写 (RoPE + GQA + RMSNorm + SwiGLU)
-统一训练框架 (TrainerBase / SFT / DPO / Distill / LoRA)
-FSDP 分布式 + BF16 混合精度
-分词器升级 (SentencePiece + 3.2 万词表 Fallback)
-完整数据管线 (采集→清洗→合成→格式化→版本管理)
-自动化评测 (MMLU / C-Eval / HumanEval)
-OpenAI 兼容 API (+ Function Calling)
-WebUI (深/亮主题, 竞技场, 思考可视化)
-Docker 容器化
-```
-
-### 第二阶段 ✅ 已完成
-
-```
-vLLM 深度集成 (Prefix Caching / Speculative Decoding / 量化 / LoRA)
-zhengliu 蒸馏管线 (5 类数据 / DPO 对 / 质量评分 / 自动纠错)
-PPO / GRPO 强化学习
-Reward Model 训练
-长上下文 128K+ (NTK-aware RoPE)
-CI/CD 流水线
-```
-
-### 第三阶段 ✅ 已完成
-
-```
-多轮代码检修（修复 37 个 Bug）
-蒸馏引擎 Checkpoint/Resume
-量化模块 FP8 per-row + INT4 chunked
-分词器 CJK 8 扩展区
-完整中文训练指南 (15 章)
-```
-
-### 第四阶段 🚧 规划中
-
-```
-多模态扩展（视觉/语音输入）
-模型注册表 + 版本管理
-vLLM 生产级 Speculative Decoding 调优
-行业种子模板库（医疗/法律/金融/制造）
-自动化数据飞轮（用户反馈 → 模型迭代）
 ```
 
 ---
