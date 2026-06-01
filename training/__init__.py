@@ -10,6 +10,8 @@ def __getattr__(name):
         "TrainerBase": ("training.trainer", "TrainerBase"),
         "SFTTrainer": ("training.sft", "SFTTrainer"),
         "SFTDataset": ("training.sft", "SFTDataset"),
+        "PretrainTrainer": ("training.pretrain", "PretrainTrainer"),
+        "PretrainDataset": ("training.pretrain", "PretrainDataset"),
         "DPOTrainer": ("training.dpo", "DPOTrainer"),
         "DPODataset": ("training.dpo", "DPODataset"),
         "DistillationTrainer": ("training.distill", "DistillationTrainer"),
@@ -39,6 +41,7 @@ def __getattr__(name):
 __all__ = [
     "TrainingConfig", "CheckpointManager", "MetricsTracker",
     "TrainerBase", "SFTTrainer", "SFTDataset",
+    "PretrainTrainer", "PretrainDataset",
     "DPOTrainer", "DPODataset",
     "DistillationTrainer", "DistillationDataset",
     "CurriculumDataset", "StageScheduler",

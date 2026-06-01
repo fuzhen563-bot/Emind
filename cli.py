@@ -103,6 +103,7 @@ def cmd_train(args):
     from model import EmindConfig, create_model
     from tokenizer import EmindTokenizer
     from training import SFTTrainer, DPOTrainer, DistillationTrainer, TrainingConfig, SFTDataset, DPODataset, DistillationDataset, apply_lora
+    from training.pretrain import PretrainDataset, PretrainTrainer
 
     tokenizer = EmindTokenizer(vocab_size=args.vocab_size, model_path=args.tokenizer_path)
 
@@ -151,7 +152,15 @@ def cmd_train(args):
                     setattr(cfg, k, v)
         print(f"[train] Config aligned to checkpoint (d_ff={cfg.d_ff}, vocab_size={cfg.vocab_size})")
 
-    if args.mode in ("sft", "pretrain"):
+    if args.mode == "pretrain":
+        dataset = PretrainDataset(raw_data, tokenizer, max_seq_len=args.max_seq_len)
+        model = create_model(cfg)
+        if args.resume and os.path.exists(args.resume):
+            state = resume_ckpt.get("model_state_dict", resume_ckpt)
+            model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()}, strict=False)
+            print(f"[Pretrain] Resumed from {args.resume}")
+        trainer = PretrainTrainer(model, train_cfg, dataset)
+    elif args.mode == "sft":
         if args.curriculum_stages > 1 or args.replay_ratio > 0:
             from training.curriculum import CurriculumDataset
             replay_raw = []
