@@ -153,7 +153,7 @@ def cmd_train(args):
         print(f"[train] Config aligned to checkpoint (d_ff={cfg.d_ff}, vocab_size={cfg.vocab_size})")
 
     if args.mode == "pretrain":
-        dataset = PretrainDataset(raw_data, tokenizer, max_seq_len=args.max_seq_len)
+        dataset = PretrainDataset(raw_data, tokenizer, max_seq_len=args.max_seq_len, use_packing=args.pack)
         model = create_model(cfg)
         if args.resume and os.path.exists(args.resume):
             state = resume_ckpt.get("model_state_dict", resume_ckpt)
@@ -596,6 +596,8 @@ def main():
     # train
     p = sub.add_parser("train", help="训练模型")
     p.add_argument("--mode", choices=["sft", "pretrain", "dpo", "distill"], default="sft")
+    p.add_argument("--pack", action="store_true", default=True, help="Sequence Packing 优化：将多条短句打包到 max_seq_len，消除 padding 浪费（仅 pretrain 模式有效，默认开启）")
+    p.add_argument("--no-pack", action="store_false", dest="pack", help="禁用 Sequence Packing，每条样本独立 padding（兼容旧行为）")
     p.add_argument("--data", default="data/train.txt")
     p.add_argument("--vocab-size", type=int, default=32000)
     p.add_argument("--d-model", type=int, default=768)

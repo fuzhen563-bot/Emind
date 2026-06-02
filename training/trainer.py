@@ -95,8 +95,11 @@ class TrainerBase:
         params = [p for p in self.model.parameters() if p.requires_grad]
         if self.config.optimizer == "adafactor":
             from torch.optim import Adafactor
-            return Adafactor(params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay,
-                             scale_parameter=False, relative_step=False, warmup_init=False)
+            try:
+                return Adafactor(params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay,
+                                 scale_parameter=False, relative_step=False, warmup_init=False)
+            except TypeError:
+                return Adafactor(params, lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
         fused = self.config.use_fused_adam and torch.cuda.is_available()
         return AdamW(
             params,
